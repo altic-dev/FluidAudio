@@ -10,15 +10,40 @@ public class DownloadUtils {
     /// Shared URLSession with registry and proxy configuration
     public static let sharedSession: URLSession = ModelRegistry.configuredSession()
 
-    /// Get HuggingFace token from environment if available.
+    /// Test-only override for the session used by internal request helpers.
+    /// `nonisolated(unsafe)` is acceptable here because it is a test seam: set once
+    /// before any concurrent access (in `setUp`), cleared in `tearDown`, never mutated
+    /// while requests are in flight.
+    nonisolated(unsafe) internal static var sessionOverride: URLSession?
+
+    /// Session used for all internal request/download traffic. Prefer this over
+    /// `sharedSession` inside the type so tests can substitute a stub session.
+    private static var session: URLSession { sessionOverride ?? sharedSession }
+
+    /// Get HuggingFace token from environment or the HF CLI token file if available.
     /// Supports multiple env vars for compatibility with different HuggingFace tools:
     /// - HF_TOKEN: Official HuggingFace CLI
     /// - HUGGING_FACE_HUB_TOKEN: Python huggingface_hub library
     /// - HUGGINGFACEHUB_API_TOKEN: LangChain and older integrations
+    /// - ~/.cache/huggingface/token: HF CLI login token file (used when no env var is set)
     private static var huggingFaceToken: String? {
-        ProcessInfo.processInfo.environment["HF_TOKEN"]
+        if let token = ProcessInfo.processInfo.environment["HF_TOKEN"]
             ?? ProcessInfo.processInfo.environment["HUGGING_FACE_HUB_TOKEN"]
             ?? ProcessInfo.processInfo.environment["HUGGINGFACEHUB_API_TOKEN"]
+        {
+            return token
+        }
+        return tokenFromCLICacheFile
+    }
+
+    /// Best-effort read of the HF CLI's cached login token. Never throws — sandboxed
+    /// apps without access to the home directory simply get `nil`.
+    private static var tokenFromCLICacheFile: String? {
+        let tokenFileURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/token")
+        guard let contents = try? String(contentsOf: tokenFileURL, encoding: .utf8) else { return nil }
+        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Create a URLRequest with optional auth header and timeout
@@ -26,6 +51,7 @@ public class DownloadUtils {
         url: URL, timeout: TimeInterval = DownloadConfig.default.timeout
     ) -> URLRequest {
         var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.setValue("FluidAudio-Swift", forHTTPHeaderField: "User-Agent")
         if let token = huggingFaceToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -36,7 +62,7 @@ public class DownloadUtils {
     /// Use this for API calls that need auth tokens for private repos or higher rate limits
     public static func fetchWithAuth(from url: URL) async throws -> (Data, URLResponse) {
         let request = authorizedRequest(url: url)
-        return try await sharedSession.data(for: request)
+        return try await session.data(for: request)
     }
 
     /// Validate that response data is JSON, not HTML error page
@@ -49,6 +75,321 @@ public class DownloadUtils {
                 throw HuggingFaceDownloadError.htmlErrorResponse(path: path, snippet: snippet)
             }
         }
+    }
+
+    // MARK: - Rate-limit-aware retry helpers
+
+    /// Whether an HTTP status code indicates HuggingFace rate limiting.
+    internal static func isRateLimitedStatus(_ code: Int) -> Bool {
+        code == 429 || code == 503
+    }
+
+    /// Compute the delay before the next retry attempt.
+    ///
+    /// Priority: the `ratelimit` response header's `t=<seconds>` field (HuggingFace's
+    /// window-reset hint) → `Retry-After` → exponential backoff. Result is clamped to
+    /// `[0.5, 300]` seconds.
+    internal static func retryDelaySeconds(
+        from response: HTTPURLResponse?, attempt: Int, minBackoff: TimeInterval
+    ) -> TimeInterval {
+        let delay: TimeInterval
+        if let seconds = rateLimitResetSeconds(from: response) {
+            delay = seconds
+        } else if let retryAfter = response?.value(forHTTPHeaderField: "Retry-After"),
+            let seconds = TimeInterval(retryAfter.trimmingCharacters(in: .whitespaces))
+        {
+            delay = seconds
+        } else {
+            delay = pow(2.0, Double(max(attempt - 1, 0))) * minBackoff
+        }
+        return min(max(delay, 0.5), 300)
+    }
+
+    /// Parse the `t=<seconds>` field out of the HuggingFace `ratelimit` header, e.g.
+    /// `"api";r=0;t=280`.
+    private static func rateLimitResetSeconds(from response: HTTPURLResponse?) -> TimeInterval? {
+        guard let header = response?.value(forHTTPHeaderField: "ratelimit") else { return nil }
+        for component in header.split(separator: ";") {
+            let trimmed = component.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("t=") else { continue }
+            return TimeInterval(trimmed.dropFirst(2))
+        }
+        return nil
+    }
+
+    /// Parse the RFC 5988 `Link` response header for a `rel="next"` pagination URL.
+    internal static func nextLinkURL(from response: HTTPURLResponse) -> URL? {
+        guard let linkHeader = response.value(forHTTPHeaderField: "Link") else { return nil }
+        for part in linkHeader.split(separator: ",") {
+            let segments = part.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard let urlSegment = segments.first, urlSegment.hasPrefix("<"), urlSegment.hasSuffix(">") else {
+                continue
+            }
+            let isNext = segments.dropFirst().contains { segment in
+                let normalized = segment.lowercased().replacingOccurrences(of: "\"", with: "")
+                return normalized == "rel=next"
+            }
+            guard isNext else { continue }
+            let urlString = String(urlSegment.dropFirst().dropLast())
+            return URL(string: urlString)
+        }
+        return nil
+    }
+
+    /// Perform a data request, retrying on 429/503 (rate limit) and transient network
+    /// errors with an appropriate backoff. Throws `HuggingFaceDownloadError.rateLimited`
+    /// once attempts are exhausted while rate limited.
+    private static func dataWithRetry(
+        request: URLRequest,
+        description: String,
+        maxAttempts: Int = 4,
+        minBackoff: TimeInterval = 1.0
+    ) async throws -> (Data, HTTPURLResponse) {
+        var attempt = 1
+        while true {
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw HuggingFaceDownloadError.invalidResponse
+                }
+
+                if isRateLimitedStatus(httpResponse.statusCode) {
+                    if attempt < maxAttempts {
+                        let delay = retryDelaySeconds(from: httpResponse, attempt: attempt, minBackoff: minBackoff)
+                        logger.warning(
+                            "Rate limited (\(httpResponse.statusCode)) while \(description), attempt \(attempt)/\(maxAttempts). Retrying in \(String(format: "%.1f", delay))s."
+                        )
+                        try Task.checkCancellation()
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        attempt += 1
+                        continue
+                    } else {
+                        throw HuggingFaceDownloadError.rateLimited(
+                            statusCode: httpResponse.statusCode,
+                            message: "Rate limited while \(description)")
+                    }
+                }
+
+                return (data, httpResponse)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled {
+                throw error
+            } catch let error as HuggingFaceDownloadError {
+                throw error
+            } catch {
+                if attempt < maxAttempts {
+                    let delay = pow(2.0, Double(max(attempt - 1, 0))) * minBackoff
+                    logger.warning(
+                        "Request failed while \(description), attempt \(attempt)/\(maxAttempts): \(error.localizedDescription). Retrying in \(String(format: "%.1f", delay))s."
+                    )
+                    try Task.checkCancellation()
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    attempt += 1
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    /// Perform a download request, retrying on 429/503 (rate limit) and transient
+    /// network errors with an appropriate backoff.
+    private static func downloadWithRetry(
+        request: URLRequest,
+        description: String,
+        onProgress: (@Sendable (Int64, Int64) -> Void)?,
+        maxAttempts: Int = 4,
+        minBackoff: TimeInterval = 1.0
+    ) async throws -> (URL, HTTPURLResponse) {
+        var attempt = 1
+        while true {
+            do {
+                let tempFileURL: URL
+                let httpResponse: HTTPURLResponse
+                if let onProgress {
+                    (tempFileURL, httpResponse) = try await downloadWithProgress(
+                        request: request, onProgress: onProgress)
+                } else {
+                    let (url, response) = try await session.download(for: request)
+                    guard let resp = response as? HTTPURLResponse else {
+                        throw HuggingFaceDownloadError.invalidResponse
+                    }
+                    tempFileURL = url
+                    httpResponse = resp
+                }
+
+                if isRateLimitedStatus(httpResponse.statusCode) {
+                    if attempt < maxAttempts {
+                        let delay = retryDelaySeconds(from: httpResponse, attempt: attempt, minBackoff: minBackoff)
+                        logger.warning(
+                            "Rate limited (\(httpResponse.statusCode)) while downloading \(description), attempt \(attempt)/\(maxAttempts). Retrying in \(String(format: "%.1f", delay))s."
+                        )
+                        // Discard the (empty/error-body) temp file from this attempt before
+                        // sleeping and retrying — nothing downstream will ever consume it.
+                        try? FileManager.default.removeItem(at: tempFileURL)
+                        try Task.checkCancellation()
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        attempt += 1
+                        continue
+                    } else {
+                        try? FileManager.default.removeItem(at: tempFileURL)
+                        throw HuggingFaceDownloadError.rateLimited(
+                            statusCode: httpResponse.statusCode,
+                            message: "Rate limited while downloading \(description)")
+                    }
+                }
+
+                return (tempFileURL, httpResponse)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled {
+                throw error
+            } catch let error as HuggingFaceDownloadError {
+                throw error
+            } catch {
+                if attempt < maxAttempts {
+                    let delay = pow(2.0, Double(max(attempt - 1, 0))) * minBackoff
+                    logger.warning(
+                        "Download failed while downloading \(description), attempt \(attempt)/\(maxAttempts): \(error.localizedDescription). Retrying in \(String(format: "%.1f", delay))s."
+                    )
+                    try Task.checkCancellation()
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    attempt += 1
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    /// Fetch and parse a full (paginated) HuggingFace repo tree listing in as few API
+    /// calls as possible, using `recursive=true` instead of walking directories one at
+    /// a time.
+    private static func listRepoTree(
+        remotePath: String, path: String
+    ) async throws -> [(path: String, size: Int, type: String)] {
+        let apiPath = path.isEmpty ? "tree/main" : "tree/main/\(path)"
+        let baseURL = try ModelRegistry.apiModels(remotePath, apiPath)
+
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw HuggingFaceDownloadError.invalidResponse
+        }
+        var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "recursive", value: "true"))
+        components.queryItems = queryItems
+
+        guard var nextURL = components.url else {
+            throw HuggingFaceDownloadError.invalidResponse
+        }
+
+        // Guards against a misbehaving/malicious server sending an unbounded or looping
+        // pagination chain.
+        let maxPages = 100
+        var seenURLs: Set<URL> = []
+
+        var results: [(path: String, size: Int, type: String)] = []
+        var page = 0
+        while true {
+            page += 1
+            guard page <= maxPages else {
+                logger.error("Aborting pagination for \(path.isEmpty ? "root" : path) after \(maxPages) pages")
+                throw HuggingFaceDownloadError.invalidResponse
+            }
+            seenURLs.insert(nextURL)
+
+            let request = authorizedRequest(url: nextURL)
+            let (data, httpResponse) = try await dataWithRetry(request: request, description: "listing files")
+
+            try validateJSONResponse(data, path: path)
+
+            guard let items = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                throw HuggingFaceDownloadError.invalidResponse
+            }
+
+            for item in items {
+                guard let itemPath = item["path"] as? String,
+                    let itemType = item["type"] as? String
+                else { continue }
+                let itemSize = item["size"] as? Int ?? -1
+                results.append((path: itemPath, size: itemSize, type: itemType))
+            }
+
+            guard let next = nextLinkURL(from: httpResponse), !seenURLs.contains(next) else { break }
+            nextURL = next
+        }
+
+        return results
+    }
+
+    /// Pure file-selection logic for `downloadRepo`.
+    ///
+    /// Given a flat repo tree listing (as returned by `listRepoTree`), the required-model
+    /// filter `patterns`, and the optional `subPath`, returns the files that should be
+    /// downloaded. Reproduces two effects the old per-directory recursive walk had:
+    ///
+    /// - Directory pruning: a file is only included if every ancestor directory strictly
+    ///   deeper than the listing root (`subPath`, or the repo root when `subPath` is nil)
+    ///   passes `directoryPasses`.
+    /// - File inclusion: the `subPath` branch requires the file be inside `subPath` and
+    ///   either match a pattern or look like metadata (`.json`/`.model`/`.bin`); the
+    ///   non-`subPath` branch matches a pattern or a `.json`/`.txt` suffix.
+    ///
+    /// Extracted as a standalone pure function (no I/O) so this selection logic can be
+    /// unit tested directly against synthetic tree listings.
+    internal static func selectFilesToDownload(
+        tree: [(path: String, size: Int, type: String)],
+        patterns: [String],
+        subPath: String?
+    ) -> [(path: String, size: Int)] {
+        // Whether a directory path is allowed to be descended into / must have all its
+        // files reachable. Mirrors the pruning a per-directory recursive walk used to do.
+        func directoryPasses(_ dirPath: String) -> Bool {
+            if let sub = subPath {
+                return dirPath == sub || dirPath.hasPrefix("\(sub)/")
+                    || patterns.contains { dirPath.hasPrefix($0) || $0.hasPrefix(dirPath + "/") }
+            }
+            return patterns.isEmpty || patterns.contains { dirPath.hasPrefix($0) || $0.hasPrefix(dirPath + "/") }
+        }
+
+        // Progressive ancestor-directory prefixes of a file path, excluding the file itself.
+        func ancestorDirectories(of filePath: String) -> [String] {
+            let components = filePath.split(separator: "/").map(String.init)
+            guard components.count > 1 else { return [] }
+            return (1..<components.count).map { components[0..<$0].joined(separator: "/") }
+        }
+
+        let rootDepth = subPath?.split(separator: "/").count ?? 0
+
+        var filesToDownload: [(path: String, size: Int)] = []
+        for entry in tree where entry.type == "file" {
+            let ancestors = ancestorDirectories(of: entry.path)
+            let isPruned = ancestors.contains { ancestor in
+                let depth = ancestor.split(separator: "/").count
+                guard depth > rootDepth else { return false }
+                return !directoryPasses(ancestor)
+            }
+            guard !isPruned else { continue }
+
+            // For subPath repos, only include files within the subPath
+            let shouldInclude: Bool
+            if let sub = subPath {
+                let isInSubPath = entry.path.hasPrefix("\(sub)/")
+                let matchesPattern =
+                    patterns.isEmpty || patterns.contains { entry.path.hasPrefix($0) }
+                let isMetadata =
+                    entry.path.hasSuffix(".json") || entry.path.hasSuffix(".model") || entry.path.hasSuffix(".bin")
+                shouldInclude = isInSubPath && (matchesPattern || isMetadata)
+            } else {
+                shouldInclude =
+                    patterns.isEmpty || patterns.contains { entry.path.hasPrefix($0) }
+                    || entry.path.hasSuffix(".json") || entry.path.hasSuffix(".txt")
+            }
+            if shouldInclude {
+                filesToDownload.append((path: entry.path, size: entry.size))
+            }
+        }
+        return filesToDownload
     }
 
     public enum HuggingFaceDownloadError: LocalizedError {
@@ -130,6 +471,13 @@ public class DownloadUtils {
                 directory: directory, computeUnits: computeUnits, variant: variant,
                 progressHandler: progressHandler)
         } catch {
+            guard !isTransientAndUnwipeable(error) else {
+                logger.warning(
+                    "First load failed with a transient/network error, not wiping cache: \(error.localizedDescription)"
+                )
+                throw error
+            }
+
             logger.warning("First load failed: \(error.localizedDescription)")
             logger.info("Deleting cache and re-downloading…")
             let repoPath = directory.appendingPathComponent(repo.folderName)
@@ -140,6 +488,27 @@ public class DownloadUtils {
                 directory: directory, computeUnits: computeUnits, variant: variant,
                 progressHandler: progressHandler)
         }
+    }
+
+    /// Errors where wiping the cache and retrying would just discard a resumable
+    /// partial download for no benefit: cancellation, rate limiting, HTML error pages
+    /// (usually rate-limit related), and any network-layer failure (offline, timeout, …).
+    private static func isTransientAndUnwipeable(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if error is URLError {
+            return true
+        }
+        if let downloadError = error as? HuggingFaceDownloadError {
+            switch downloadError {
+            case .rateLimited, .htmlErrorResponse:
+                return true
+            case .invalidResponse, .downloadFailed, .modelNotFound:
+                return false
+            }
+        }
+        return false
     }
 
     public static func clearModelCache(forRepo repo: Repo, directory: URL) {
@@ -289,76 +658,12 @@ public class DownloadUtils {
             }
         }
 
-        // Get all files recursively using HuggingFace API
-        var filesToDownload: [(path: String, size: Int)] = []
-
-        func listDirectory(path: String) async throws {
-            let apiPath = path.isEmpty ? "tree/main" : "tree/main/\(path)"
-            let dirURL = try ModelRegistry.apiModels(repo.remotePath, apiPath)
-            let request = authorizedRequest(url: dirURL)
-
-            let (dirData, response) = try await sharedSession.data(for: request)
-
-            if let httpResponse = response as? HTTPURLResponse {
-                if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
-                    throw HuggingFaceDownloadError.rateLimited(
-                        statusCode: httpResponse.statusCode, message: "Rate limited while listing files")
-                }
-            }
-
-            // Validate that response is JSON, not HTML error page
-            try validateJSONResponse(dirData, path: path)
-
-            guard let items = try JSONSerialization.jsonObject(with: dirData) as? [[String: Any]] else {
-                throw HuggingFaceDownloadError.invalidResponse
-            }
-
-            for item in items {
-                guard let itemPath = item["path"] as? String,
-                    let itemType = item["type"] as? String
-                else { continue }
-
-                if itemType == "directory" {
-                    // For subPath repos, only process paths within the subPath
-                    let shouldProcess: Bool
-                    if let sub = subPath {
-                        shouldProcess =
-                            itemPath == sub || itemPath.hasPrefix("\(sub)/")
-                            || patterns.contains { itemPath.hasPrefix($0) || $0.hasPrefix(itemPath + "/") }
-                    } else {
-                        shouldProcess =
-                            patterns.isEmpty
-                            || patterns.contains { itemPath.hasPrefix($0) || $0.hasPrefix(itemPath + "/") }
-                    }
-                    if shouldProcess {
-                        try await listDirectory(path: itemPath)
-                    }
-                } else if itemType == "file" {
-                    // For subPath repos, only include files within the subPath
-                    let shouldInclude: Bool
-                    if let sub = subPath {
-                        let isInSubPath = itemPath.hasPrefix("\(sub)/")
-                        let matchesPattern =
-                            patterns.isEmpty || patterns.contains { itemPath.hasPrefix($0) }
-                        let isMetadata =
-                            itemPath.hasSuffix(".json") || itemPath.hasSuffix(".model") || itemPath.hasSuffix(".bin")
-                        shouldInclude = isInSubPath && (matchesPattern || isMetadata)
-                    } else {
-                        shouldInclude =
-                            patterns.isEmpty || patterns.contains { itemPath.hasPrefix($0) }
-                            || itemPath.hasSuffix(".json") || itemPath.hasSuffix(".txt")
-                    }
-                    if shouldInclude {
-                        let fileSize = item["size"] as? Int ?? -1
-                        filesToDownload.append((path: itemPath, size: fileSize))
-                    }
-                }
-            }
-        }
-
-        // Start listing from subPath if specified, otherwise from root
+        // Get all files recursively in a single (paginated) API call, then reproduce the
+        // pruning + inclusion semantics of the old per-directory recursive walk.
         progressHandler?(DownloadProgress(fractionCompleted: 0.0, phase: .listing))
-        try await listDirectory(path: subPath ?? "")
+        let tree = try await listRepoTree(remotePath: repo.remotePath, path: subPath ?? "")
+
+        let filesToDownload = selectFilesToDownload(tree: tree, patterns: patterns, subPath: subPath)
         logger.info("Found \(filesToDownload.count) files to download")
 
         // Compute total known bytes for byte-weighted progress.
@@ -406,8 +711,9 @@ public class DownloadUtils {
                 let baseBytes = completedBytes
                 let fileCount = filesToDownload.count
                 let totalBytesSnapshot = totalBytes
-                (tempFileURL, httpResponse) = try await downloadWithProgress(
+                (tempFileURL, httpResponse) = try await downloadWithRetry(
                     request: request,
+                    description: file.path,
                     onProgress: { bytesWritten, _ in
                         guard totalBytesSnapshot > 0 else { return }
                         let current = baseBytes + bytesWritten
@@ -421,19 +727,8 @@ public class DownloadUtils {
                     }
                 )
             } else {
-                let (url, response) = try await sharedSession.download(for: request)
-                guard let resp = response as? HTTPURLResponse else {
-                    throw HuggingFaceDownloadError.invalidResponse
-                }
-                tempFileURL = url
-                httpResponse = resp
-            }
-
-            // Validate response
-            if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
-                throw HuggingFaceDownloadError.rateLimited(
-                    statusCode: httpResponse.statusCode,
-                    message: "Rate limited while downloading \(file.path)")
+                (tempFileURL, httpResponse) = try await downloadWithRetry(
+                    request: request, description: file.path, onProgress: nil)
             }
 
             guard (200..<300).contains(httpResponse.statusCode) else {
@@ -497,14 +792,14 @@ public class DownloadUtils {
                     onProgress: onProgress,
                     completion: { continuation.resume(with: $0) }
                 )
-                let session = URLSession(
-                    configuration: sharedSession.configuration,
+                let delegateSession = URLSession(
+                    configuration: session.configuration,
                     delegate: delegate,
                     delegateQueue: nil
                 )
-                delegate.session = session
+                delegate.session = delegateSession
 
-                let task = session.downloadTask(with: request)
+                let task = delegateSession.downloadTask(with: request)
                 taskHolder.setTask(task)
                 task.resume()
             }
@@ -528,40 +823,11 @@ public class DownloadUtils {
         subdirectory: String,
         to repoDirectory: URL
     ) async throws {
-        var filesToDownload: [(path: String, size: Int)] = []
-
-        func listFiles(at path: String) async throws {
-            let dirURL = try ModelRegistry.apiModels(repo.remotePath, "tree/main/\(path)")
-            let (dirData, response) = try await fetchWithAuth(from: dirURL)
-            if let httpResponse = response as? HTTPURLResponse,
-                httpResponse.statusCode == 429 || httpResponse.statusCode == 503
-            {
-                throw HuggingFaceDownloadError.rateLimited(
-                    statusCode: httpResponse.statusCode,
-                    message: "Rate limited while listing files in \(path)")
-            }
-
-            // Validate that response is JSON, not HTML error page
-            try validateJSONResponse(dirData, path: path)
-
-            guard let items = try JSONSerialization.jsonObject(with: dirData) as? [[String: Any]] else {
-                throw HuggingFaceDownloadError.invalidResponse
-            }
-            for item in items {
-                guard let itemPath = item["path"] as? String,
-                    let itemType = item["type"] as? String
-                else { continue }
-
-                if itemType == "directory" {
-                    try await listFiles(at: itemPath)
-                } else if itemType == "file" {
-                    let fileSize = item["size"] as? Int ?? -1
-                    filesToDownload.append((path: itemPath, size: fileSize))
-                }
-            }
-        }
-
-        try await listFiles(at: subdirectory)
+        let tree = try await listRepoTree(remotePath: repo.remotePath, path: subdirectory)
+        let filesToDownload: [(path: String, size: Int)] =
+            tree
+            .filter { $0.type == "file" }
+            .map { (path: $0.path, size: $0.size) }
         logger.info("Found \(filesToDownload.count) files in \(subdirectory)")
 
         for (index, file) in filesToDownload.enumerated() {
@@ -586,16 +852,8 @@ public class DownloadUtils {
             let fileURL = try ModelRegistry.resolveModel(repo.remotePath, encodedPath)
             let request = authorizedRequest(url: fileURL)
 
-            let (tempURL, response) = try await sharedSession.download(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw HuggingFaceDownloadError.invalidResponse
-            }
-
-            if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
-                throw HuggingFaceDownloadError.rateLimited(
-                    statusCode: httpResponse.statusCode,
-                    message: "Rate limited while downloading \(file.path)")
-            }
+            let (tempURL, httpResponse) = try await downloadWithRetry(
+                request: request, description: file.path, onProgress: nil)
 
             guard (200..<300).contains(httpResponse.statusCode) else {
                 throw HuggingFaceDownloadError.downloadFailed(
@@ -618,49 +876,26 @@ public class DownloadUtils {
     }
 
     /// Fetch a single file from HuggingFace with retry
+    ///
+    /// Rate-limit (429/503) retries and transient network-error retries both happen
+    /// inside `dataWithRetry`, sharing the full `maxAttempts` budget so 429s use
+    /// HuggingFace's header-provided delay instead of blind exponential backoff.
     public static func fetchHuggingFaceFile(
         from url: URL,
         description: String,
         maxAttempts: Int = 4,
         minBackoff: TimeInterval = 1.0
     ) async throws -> Data {
-        var lastError: Error?
         let request = authorizedRequest(url: url)
 
-        for attempt in 1...maxAttempts {
-            do {
-                let (data, response) = try await sharedSession.data(for: request)
+        let (data, httpResponse) = try await dataWithRetry(
+            request: request, description: description, maxAttempts: maxAttempts, minBackoff: minBackoff)
 
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw HuggingFaceDownloadError.invalidResponse
-                }
-
-                if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
-                    throw HuggingFaceDownloadError.rateLimited(
-                        statusCode: httpResponse.statusCode,
-                        message: "HTTP \(httpResponse.statusCode)"
-                    )
-                }
-
-                guard (200..<300).contains(httpResponse.statusCode) else {
-                    throw HuggingFaceDownloadError.invalidResponse
-                }
-
-                return data
-
-            } catch {
-                lastError = error
-                if attempt < maxAttempts {
-                    let backoffSeconds = pow(2.0, Double(attempt - 1)) * minBackoff
-                    logger.warning(
-                        "Download attempt \(attempt) for \(description) failed: \(error.localizedDescription). Retrying in \(String(format: "%.1f", backoffSeconds))s."
-                    )
-                    try await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
-                }
-            }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw HuggingFaceDownloadError.invalidResponse
         }
 
-        throw lastError ?? HuggingFaceDownloadError.invalidResponse
+        return data
     }
 }
 
