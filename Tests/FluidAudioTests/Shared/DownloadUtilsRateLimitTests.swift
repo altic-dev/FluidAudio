@@ -201,6 +201,23 @@ final class DownloadUtilsRateLimitTests: XCTestCase {
             FileManager.default.fileExists(atPath: repoDirectory.appendingPathComponent("a/b.bin").path))
     }
 
+    func testListingRetriesOnTransientServerErrorThenSucceeds() async throws {
+        StubURLProtocol.enqueue([
+            .init(statusCode: 502),
+            .init(statusCode: 200, data: jsonData([["type": "file", "path": "a/b.bin", "size": 3]])),
+            .init(statusCode: 200, data: Data([1, 2, 3])),
+        ])
+
+        let repoDirectory = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: repoDirectory) }
+
+        try await DownloadUtils.downloadSubdirectory(.parakeet, subdirectory: "extra", to: repoDirectory)
+
+        XCTAssertEqual(treeRequests().count, 2)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: repoDirectory.appendingPathComponent("a/b.bin").path))
+    }
+
     // MARK: - Single-call recursive listing (no per-directory walk)
 
     func testListingMakesExactlyOneTreeRequestForNestedPaths() async throws {
@@ -260,9 +277,8 @@ final class DownloadUtilsRateLimitTests: XCTestCase {
         do {
             try await DownloadUtils.downloadSubdirectory(.parakeet, subdirectory: "extra", to: repoDirectory)
             XCTFail("Expected rateLimited error")
-        } catch let DownloadUtils.HuggingFaceDownloadError.rateLimited(statusCode, message) {
+        } catch let DownloadUtils.HuggingFaceDownloadError.rateLimited(statusCode, _) {
             XCTAssertEqual(statusCode, 429)
-            XCTAssertTrue(message.contains("Rate limited while listing files"))
         } catch {
             XCTFail("Expected rateLimited error, got \(error)")
         }

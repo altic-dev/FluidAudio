@@ -1,6 +1,7 @@
 import CoreML
 import Foundation
 import OSLog
+import os
 
 /// HuggingFace model downloader using URLSession
 public class DownloadUtils {
@@ -26,7 +27,8 @@ public class DownloadUtils {
     /// - HUGGING_FACE_HUB_TOKEN: Python huggingface_hub library
     /// - HUGGINGFACEHUB_API_TOKEN: LangChain and older integrations
     /// - ~/.cache/huggingface/token: HF CLI login token file (used when no env var is set)
-    private static var huggingFaceToken: String? {
+    /// Resolved once per process: a token added after launch is picked up on next start.
+    private static let huggingFaceToken: String? = {
         if let token = ProcessInfo.processInfo.environment["HF_TOKEN"]
             ?? ProcessInfo.processInfo.environment["HUGGING_FACE_HUB_TOKEN"]
             ?? ProcessInfo.processInfo.environment["HUGGINGFACEHUB_API_TOKEN"]
@@ -34,7 +36,7 @@ public class DownloadUtils {
             return token
         }
         return tokenFromCLICacheFile
-    }
+    }()
 
     /// Best-effort read of the HF CLI's cached login token. Never throws — sandboxed
     /// apps without access to the home directory simply get `nil`.
@@ -82,6 +84,11 @@ public class DownloadUtils {
     /// Whether an HTTP status code indicates HuggingFace rate limiting.
     internal static func isRateLimitedStatus(_ code: Int) -> Bool {
         code == 429 || code == 503
+    }
+
+    /// Whether an HTTP status code indicates a transient server-side failure worth retrying.
+    internal static func isTransientServerStatus(_ code: Int) -> Bool {
+        code == 500 || code == 502 || code == 504
     }
 
     /// Compute the delay before the next retry attempt.
@@ -153,21 +160,24 @@ public class DownloadUtils {
                     throw HuggingFaceDownloadError.invalidResponse
                 }
 
-                if isRateLimitedStatus(httpResponse.statusCode) {
+                let status = httpResponse.statusCode
+                if isRateLimitedStatus(status) || isTransientServerStatus(status) {
                     if attempt < maxAttempts {
                         let delay = retryDelaySeconds(from: httpResponse, attempt: attempt, minBackoff: minBackoff)
                         logger.warning(
-                            "Rate limited (\(httpResponse.statusCode)) while \(description), attempt \(attempt)/\(maxAttempts). Retrying in \(String(format: "%.1f", delay))s."
+                            "HTTP \(status) while \(description), attempt \(attempt)/\(maxAttempts). Retrying in \(String(format: "%.1f", delay))s."
                         )
                         try Task.checkCancellation()
                         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                         attempt += 1
                         continue
-                    } else {
+                    } else if isRateLimitedStatus(status) {
                         throw HuggingFaceDownloadError.rateLimited(
-                            statusCode: httpResponse.statusCode,
+                            statusCode: status,
                             message: "Rate limited while \(description)")
                     }
+                    // Exhausted retries on a transient 5xx: return the response and let the
+                    // caller's status validation surface the failure.
                 }
 
                 return (data, httpResponse)
@@ -219,11 +229,12 @@ public class DownloadUtils {
                     httpResponse = resp
                 }
 
-                if isRateLimitedStatus(httpResponse.statusCode) {
+                let status = httpResponse.statusCode
+                if isRateLimitedStatus(status) || isTransientServerStatus(status) {
                     if attempt < maxAttempts {
                         let delay = retryDelaySeconds(from: httpResponse, attempt: attempt, minBackoff: minBackoff)
                         logger.warning(
-                            "Rate limited (\(httpResponse.statusCode)) while downloading \(description), attempt \(attempt)/\(maxAttempts). Retrying in \(String(format: "%.1f", delay))s."
+                            "HTTP \(status) while downloading \(description), attempt \(attempt)/\(maxAttempts). Retrying in \(String(format: "%.1f", delay))s."
                         )
                         // Discard the (empty/error-body) temp file from this attempt before
                         // sleeping and retrying — nothing downstream will ever consume it.
@@ -232,12 +243,14 @@ public class DownloadUtils {
                         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                         attempt += 1
                         continue
-                    } else {
+                    } else if isRateLimitedStatus(status) {
                         try? FileManager.default.removeItem(at: tempFileURL)
                         throw HuggingFaceDownloadError.rateLimited(
-                            statusCode: httpResponse.statusCode,
+                            statusCode: status,
                             message: "Rate limited while downloading \(description)")
                     }
+                    // Exhausted retries on a transient 5xx: return the response and let the
+                    // caller's status validation surface the failure.
                 }
 
                 return (tempFileURL, httpResponse)
@@ -670,6 +683,9 @@ public class DownloadUtils {
         // Files with unknown sizes (size == -1) are treated as 0 for weighting.
         let totalBytes: Int64 = filesToDownload.reduce(0) { $0 + Int64(max(0, $1.size)) }
         var completedBytes: Int64 = 0
+        // Highest download-phase fraction reported so far; keeps progress monotonic
+        // across per-file retries (a retried attempt restarts its byte count at zero).
+        let maxReportedFraction = OSAllocatedUnfairLock(initialState: 0.0)
 
         // Download each file
         for (index, file) in filesToDownload.enumerated() {
@@ -717,11 +733,17 @@ public class DownloadUtils {
                     onProgress: { bytesWritten, _ in
                         guard totalBytesSnapshot > 0 else { return }
                         let current = baseBytes + bytesWritten
-                        // Download phase occupies 0.0–0.5 of the overall range.
-                        let fraction = 0.5 * Double(current) / Double(totalBytesSnapshot)
+                        // Download phase occupies 0.0–0.5 of the overall range. Clamp to the
+                        // highest fraction reported so far: a retried attempt restarts its
+                        // byte count at zero and must not rewind the visible progress.
+                        let fraction = min(0.5 * Double(current) / Double(totalBytesSnapshot), 0.5)
+                        let monotonic = maxReportedFraction.withLock { maxSoFar in
+                            maxSoFar = max(maxSoFar, fraction)
+                            return maxSoFar
+                        }
                         handler(
                             DownloadProgress(
-                                fractionCompleted: min(fraction, 0.5),
+                                fractionCompleted: monotonic,
                                 phase: .downloading(completedFiles: index, totalFiles: fileCount)
                             ))
                     }
