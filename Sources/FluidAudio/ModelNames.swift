@@ -7,6 +7,7 @@ public enum Repo: String, CaseIterable {
     case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
     case parakeetCtc110m = "FluidInference/parakeet-ctc-110m-coreml"
     case parakeetCtc06b = "FluidInference/parakeet-ctc-0.6b-coreml"
+    case senseVoiceSmall = "FluidInference/sensevoice-small-coreml"
     case parakeetEou160 = "FluidInference/parakeet-realtime-eou-120m-coreml/160ms"
     case parakeetEou320 = "FluidInference/parakeet-realtime-eou-120m-coreml/320ms"
     case parakeetEou1280 = "FluidInference/parakeet-realtime-eou-120m-coreml/1280ms"
@@ -35,6 +36,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-ctc-110m-coreml"
         case .parakeetCtc06b:
             return "parakeet-ctc-0.6b-coreml"
+        case .senseVoiceSmall:
+            return "sensevoice-small-coreml"
         case .parakeetEou160:
             return "parakeet-realtime-eou-120m-coreml/160ms"
         case .parakeetEou320:
@@ -272,6 +275,28 @@ public enum ModelNames {
             decoderFile,
             jointFile,
             vocab,
+        ]
+    }
+
+    /// SenseVoiceSmall CoreML model names.
+    public enum SenseVoice {
+        public static let preprocessor = "SenseVoicePreprocessor"
+        public static let encoder = "SenseVoiceSmall"
+        public static let encoderInt8 = "SenseVoiceSmall_int8"
+        public static let encoderFp32 = "SenseVoiceSmall_fp32"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let encoderInt8File = encoderInt8 + ".mlmodelc"
+        public static let encoderFp32File = encoderFp32 + ".mlmodelc"
+        public static let vocabularyFile = "vocab.json"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            encoderFile,
+            encoderInt8File,
+            encoderFp32File,
+            vocabularyFile,
         ]
     }
 
@@ -584,6 +609,8 @@ public enum ModelNames {
             return ModelNames.ASR.requiredModelsFused
         case .parakeetCtc110m, .parakeetCtc06b:
             return ModelNames.CTC.requiredModels
+        case .senseVoiceSmall:
+            return ModelNames.SenseVoice.requiredModels
         case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return ModelNames.ParakeetEOU.requiredModels
         case .nemotronStreaming1120, .nemotronStreaming560:
