@@ -26,7 +26,9 @@ extension AsrManager {
     }
 
     internal func transcribeWithState(
-        _ audioSamples: [Float], source: AudioSource
+        _ audioSamples: [Float],
+        source: AudioSource,
+        applyVocabularyBoosting: Bool = true
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
         guard audioSamples.count >= 16_000 else { throw ASRError.invalidAudioData }
@@ -76,7 +78,7 @@ extension AsrManager {
             )
 
             // Auto-apply vocabulary rescoring when configured
-            if vocabBoostingEnabled {
+            if applyVocabularyBoosting, vocabBoostingEnabled {
                 result = await applyVocabularyRescoring(result: result, audioSamples: audioSamples)
             }
 
@@ -103,7 +105,7 @@ extension AsrManager {
         )
 
         // Auto-apply vocabulary rescoring when configured
-        if vocabBoostingEnabled {
+        if applyVocabularyBoosting, vocabBoostingEnabled {
             result = await applyVocabularyRescoring(result: result, audioSamples: audioSamples)
         }
 
