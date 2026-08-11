@@ -8,36 +8,10 @@ struct ChunkProcessor {
 
     private let logger = AppLogger(category: "ChunkProcessor")
     private typealias TokenWindow = AsrChunkTokenMerger.TokenWindow
-
-    // Stateless chunking aligned with CoreML reference:
-    // - process ~14.96s of audio per window (frame-aligned) to stay under encoder limit
-    // - 2.0s overlap (frame-aligned) to give the decoder slack when merging windows
-    private let sampleRate: Int = 16000
-    private let overlapSeconds: Double = 2.0
-
-    /// Context samples prepended from previous chunk for mel spectrogram stability (80ms = 1 encoder frame).
-    /// The FastConformer encoder's depthwise convolutions need left context for stable output.
-    /// Without this, the first frames of a chunk may produce features that cause all-blank predictions.
-    private let melContextSamples: Int = ASRConstants.samplesPerEncoderFrame  // 1280 samples = 80ms
-
-    private var maxModelSamples: Int { ASRConstants.maxModelSamples }
-
-    private var chunkSamples: Int {
-        // Reserve space for context samples that will be prepended to non-first chunks.
-        // This ensures chunkSamples + melContextSamples <= maxModelSamples.
-        let maxActualChunk = maxModelSamples - melContextSamples  // 240000 - 1280 = 238720
-        let raw = max(maxActualChunk - ASRConstants.melHopSize, ASRConstants.samplesPerEncoderFrame)
-        return raw / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
-    }
-    private var overlapSamples: Int {
-        let requested = Int(overlapSeconds * Double(sampleRate))
-        let capped = min(requested, chunkSamples / 2)
-        return capped / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
-    }
-    private var strideSamples: Int {
-        let raw = max(chunkSamples - overlapSamples, ASRConstants.samplesPerEncoderFrame)
-        return raw / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
-    }
+    private let layout = ParakeetChunkLayout.standard
+    private var sampleRate: Int { layout.sampleRate }
+    private var overlapSeconds: Double { layout.overlapSeconds }
+    private var strideSamples: Int { layout.strideSamples }
 
     /// Initialize with a streaming audio sample source for memory-efficient processing.
     init(sampleSource: StreamingAudioSampleSource) {
@@ -74,7 +48,8 @@ struct ChunkProcessor {
                 confidences: [],
                 encoderSequenceLength: 0,
                 audioSamples: [],
-                processingTime: Date().timeIntervalSince(startTime)
+                processingTime: Date().timeIntervalSince(startTime),
+                audioSampleCount: totalSamples
             )
         }
 
@@ -101,7 +76,8 @@ struct ChunkProcessor {
             tokenDurations: allDurations,
             encoderSequenceLength: 0,  // Not relevant for chunk processing
             audioSamples: [],
-            processingTime: Date().timeIntervalSince(startTime)
+            processingTime: Date().timeIntervalSince(startTime),
+            audioSampleCount: totalSamples
         )
     }
 
@@ -112,14 +88,7 @@ struct ChunkProcessor {
         environmentMode != "serial" && supportsPipelining
     }
 
-    private struct ChunkWork: Sendable {
-        let samples: [Float]
-        let paddedSamples: [Float]
-        let contextSamples: Int
-        let chunkStart: Int
-        let chunkEnd: Int
-        let isLastChunk: Bool
-    }
+    private typealias ChunkWork = ParakeetChunkWork
 
     private func processChunks(
         using manager: AsrManager,
@@ -179,7 +148,7 @@ struct ChunkProcessor {
                     decoderState: &chunkDecoderState
                 )
                 preparedEncoder = nil
-                chunkOutputs.append(try makeTokenWindow(from: output))
+                chunkOutputs.append(try ParakeetChunkInference.makeTokenWindow(from: output))
             } catch {
                 if let preparedPreprocessor {
                     await manager.discardParakeetPreprocessorOutput(preparedPreprocessor)
@@ -301,7 +270,7 @@ struct ChunkProcessor {
                     decoderState: &chunkDecoderState
                 )
                 currentEncoder = nil
-                chunkOutputs.append(try makeTokenWindow(from: output))
+                chunkOutputs.append(try ParakeetChunkInference.makeTokenWindow(from: output))
             } catch {
                 if let initialPreprocessor {
                     await manager.discardParakeetPreprocessorOutput(initialPreprocessor)
@@ -342,29 +311,13 @@ struct ChunkProcessor {
     }
 
     private func makeChunkWork(chunkStart: Int, chunkIndex: Int) throws -> ChunkWork? {
-        guard chunkStart < totalSamples else { return nil }
-
-        let candidateEnd = chunkStart + chunkSamples
-        let isLastChunk = candidateEnd >= totalSamples
-        let chunkEnd = isLastChunk ? totalSamples : candidateEnd
-        guard chunkEnd > chunkStart else { return nil }
-
-        let contextSamples = chunkIndex > 0 ? melContextSamples : 0
-        let contextStart = chunkStart - contextSamples
-        let chunkLengthWithContext = chunkEnd - contextStart
-        let samples = try readSamples(offset: contextStart, count: chunkLengthWithContext)
-        let paddedSamples =
-            samples.count < maxModelSamples
-            ? samples + Array(repeating: 0, count: maxModelSamples - samples.count)
-            : samples
-
-        return ChunkWork(
-            samples: samples,
-            paddedSamples: paddedSamples,
-            contextSamples: contextSamples,
+        try layout.makeWork(
+            totalSamples: totalSamples,
             chunkStart: chunkStart,
-            chunkEnd: chunkEnd,
-            isLastChunk: isLastChunk
+            chunkIndex: chunkIndex,
+            readSamples: { offset, count in
+                try readSamples(offset: offset, count: count)
+            }
         )
     }
 
@@ -414,25 +367,6 @@ struct ChunkProcessor {
         }
     }
 
-    private func makeTokenWindow(
-        from output: (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int])
-    ) throws -> [TokenWindow] {
-        guard output.tokens.count == output.timestamps.count,
-            output.tokens.count == output.confidences.count
-        else {
-            throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
-        }
-
-        let durations =
-            output.durations.count == output.tokens.count
-            ? output.durations : Array(repeating: 0, count: output.tokens.count)
-        return zip(
-            zip(zip(output.tokens, output.timestamps), output.confidences), durations
-        ).map {
-            (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
-        }
-    }
-
     private func readSamples(offset: Int, count: Int) throws -> [Float] {
         var buffer = [Float](repeating: 0, count: count)
         try buffer.withUnsafeMutableBufferPointer { pointer in
@@ -447,27 +381,12 @@ struct ChunkProcessor {
         using manager: AsrManager,
         decoderState: inout TdtDecoderState
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int]) {
-        let actualAudioSamples = work.samples.count - work.contextSamples
-        let actualFrameCount = ASRConstants.calculateEncoderFrames(from: actualAudioSamples)
-        let globalFrameOffset = work.chunkStart / ASRConstants.samplesPerEncoderFrame
-        let contextFrames = work.contextSamples / ASRConstants.samplesPerEncoderFrame
-
-        let (hypothesis, encoderSequenceLength) = try await manager.executeMLInferenceWithTimings(
+        try await ParakeetChunkInference.transcribe(
+            work: work,
             preparedEncoder: preparedEncoder,
-            paddedAudio: work.paddedSamples,
-            originalLength: work.samples.count,
-            actualAudioFrames: actualFrameCount,
-            decoderState: &decoderState,
-            contextFrameAdjustment: contextFrames,
-            isLastChunk: work.isLastChunk,
-            globalFrameOffset: globalFrameOffset
+            using: manager,
+            decoderState: &decoderState
         )
-
-        if hypothesis.isEmpty || encoderSequenceLength == 0 {
-            return ([], [], [], [])
-        }
-
-        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
     }
 
 }

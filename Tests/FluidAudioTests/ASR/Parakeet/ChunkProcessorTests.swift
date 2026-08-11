@@ -193,6 +193,54 @@ final class ChunkProcessorTests: XCTestCase {
         XCTAssertEqual(audio.count, 480_000, "30 second audio should be 480,000 samples")
     }
 
+    func testSharedChunkLayoutMatchesProductionGeometry() {
+        let layout = ParakeetChunkLayout.standard
+
+        XCTAssertEqual(layout.chunkSamples, 238_080)
+        XCTAssertEqual(layout.overlapSamples, 32_000)
+        XCTAssertEqual(layout.strideSamples, 206_080)
+        XCTAssertEqual(layout.melContextSamples, 1_280)
+    }
+
+    func testStableWindowRequiresSampleBeyondBatchCandidateEnd() {
+        let layout = ParakeetChunkLayout.standard
+
+        XCTAssertFalse(
+            layout.isStableWindow(
+                chunkStart: 0,
+                availableSamples: layout.chunkSamples
+            )
+        )
+        XCTAssertTrue(
+            layout.isStableWindow(
+                chunkStart: 0,
+                availableSamples: layout.chunkSamples + 1
+            )
+        )
+    }
+
+    func testSharedLayoutBuildsContextIdenticallyForLaterChunks() throws {
+        let layout = ParakeetChunkLayout.standard
+        let totalSamples = layout.strideSamples + layout.chunkSamples + 1
+        let samples = (0..<totalSamples).map(Float.init)
+        let secondWork = try XCTUnwrap(
+            layout.makeWork(
+                totalSamples: totalSamples,
+                chunkStart: layout.strideSamples,
+                chunkIndex: 1,
+                readSamples: { offset, count in
+                    Array(samples[offset..<(offset + count)])
+                }
+            )
+        )
+
+        XCTAssertEqual(secondWork.contextSamples, layout.melContextSamples)
+        XCTAssertEqual(secondWork.samples.count, layout.chunkSamples + layout.melContextSamples)
+        XCTAssertEqual(secondWork.samples.first, Float(layout.strideSamples - layout.melContextSamples))
+        XCTAssertEqual(secondWork.chunkEnd, layout.strideSamples + layout.chunkSamples)
+        XCTAssertFalse(secondWork.isLastChunk)
+    }
+
     func testChunkBoundaryCalculations() {
         // Test that chunks are properly aligned with stride boundaries
         // chunkStart should increment by strideSamples each iteration

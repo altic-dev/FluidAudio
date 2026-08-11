@@ -101,6 +101,22 @@ final class AsrTranscriptionTests: XCTestCase {
         XCTAssertTrue(result.tokenTimings?.isEmpty == true)  // No timestamps provided, should be empty array
     }
 
+    func testProcessTranscriptionResultUsesExplicitSampleCountWithoutWaveform() async {
+        await setupMockVocabulary()
+
+        let result = await manager.processTranscriptionResult(
+            tokenIds: [1],
+            confidences: [0.9],
+            encoderSequenceLength: 10,
+            audioSamples: [],
+            processingTime: 0.1,
+            audioSampleCount: 32_000
+        )
+
+        XCTAssertEqual(result.duration, 2.0, accuracy: 0.01)
+        XCTAssertEqual(result.confidence, 0.9, accuracy: 0.01)
+    }
+
     func testProcessTranscriptionResultWithTimings() async {
         await setupMockVocabulary()
         let tokenIds = [10, 20, 30]
