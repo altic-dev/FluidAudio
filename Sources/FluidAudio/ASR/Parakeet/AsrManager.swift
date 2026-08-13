@@ -32,6 +32,10 @@ public actor AsrManager {
         return asrModels?.version.decoderLayers ?? 2
     }
 
+    internal var parallelChunkConcurrency: Int {
+        pronunciationCustomizationEnabled ? 1 : config.parallelChunkConcurrency
+    }
+
     /// Token duration optimization model
 
     /// Cached vocabulary loaded once during initialization
@@ -64,11 +68,24 @@ public actor AsrManager {
         AsrModels.optimizedPredictionOptions()
     }()
 
-    public init(config: ASRConfig = .default) {
+    public init(config: ASRConfig = .default, models: AsrModels? = nil) {
         self.config = config
 
         self.microphoneDecoderState = TdtDecoderState.make()
         self.systemDecoderState = TdtDecoderState.make()
+
+        if let models {
+            self.asrModels = models
+            self.preprocessorModel = models.preprocessor
+            self.encoderModel = models.encoder
+            self.decoderModel = models.decoder
+            self.jointModel = models.joint
+            self.vocabulary = models.vocabulary
+
+            let layers = models.version.decoderLayers
+            self.microphoneDecoderState = TdtDecoderState.make(decoderLayers: layers)
+            self.systemDecoderState = TdtDecoderState.make(decoderLayers: layers)
+        }
 
         // Pre-warm caches if possible
         Task {
@@ -89,6 +106,11 @@ public actor AsrManager {
         Task {
             await emitter.ensureSession()
         }
+    }
+
+    internal func makeWorkerClone() -> AsrManager? {
+        guard let models = asrModels else { return nil }
+        return AsrManager(config: config, models: models)
     }
 
     /// Returns the current transcription progress stream for offline long audio (>240,000 samples / ~15s).
@@ -359,6 +381,7 @@ public actor AsrManager {
                 sampleRate: config.sampleRate,
                 tdtConfig: config.tdtConfig,
                 encoderHiddenSize: models.version.encoderHiddenSize,
+                parallelChunkConcurrency: config.parallelChunkConcurrency,
                 streamingEnabled: config.streamingEnabled,
                 streamingThreshold: config.streamingThreshold
             )

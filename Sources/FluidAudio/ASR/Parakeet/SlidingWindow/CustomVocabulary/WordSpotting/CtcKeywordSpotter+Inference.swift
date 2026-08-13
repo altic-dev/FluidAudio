@@ -1,3 +1,4 @@
+import Accelerate
 import CoreML
 import Foundation
 
@@ -261,9 +262,42 @@ extension CtcKeywordSpotter {
             array = try MLMultiArray(shape: [NSNumber(value: maxModelSamples)], dataType: dataType)
         }
 
-        // Copy actual samples (MLMultiArray is zero-initialized, so padding is implicit).
-        for i in 0..<clampedCount {
-            array[i] = NSNumber(value: audioSamples[i])
+        // Copy actual samples directly into the backing buffer. MLMultiArray is
+        // zero-initialized, so the unused fixed-length tail remains padded.
+        if clampedCount > 0 {
+            switch dataType {
+            case .float16:
+                let destination = array.dataPointer.bindMemory(to: UInt16.self, capacity: array.count)
+                let conversionError = audioSamples.withUnsafeBufferPointer { sourceBuffer -> vImage_Error in
+                    guard let source = sourceBuffer.baseAddress else { return kvImageNullPointerArgument }
+                    var sourceImage = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: source),
+                        height: 1,
+                        width: vImagePixelCount(clampedCount),
+                        rowBytes: clampedCount * MemoryLayout<Float>.stride
+                    )
+                    var destinationImage = vImage_Buffer(
+                        data: destination,
+                        height: 1,
+                        width: vImagePixelCount(clampedCount),
+                        rowBytes: clampedCount * MemoryLayout<UInt16>.stride
+                    )
+                    return vImageConvert_PlanarFtoPlanar16F(&sourceImage, &destinationImage, 0)
+                }
+                guard conversionError == kvImageNoError else {
+                    throw ASRError.processingFailed(
+                        "Failed to convert CTC audio input to Float16 (vImage error \(conversionError))"
+                    )
+                }
+            case .float32:
+                let destination = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
+                audioSamples.withUnsafeBufferPointer { source in
+                    guard let sourceBase = source.baseAddress else { return }
+                    destination.update(from: sourceBase, count: clampedCount)
+                }
+            default:
+                throw ASRError.processingFailed("Unsupported CTC audio input type: \(dataType.rawValue)")
+            }
         }
 
         if debugMode {
@@ -334,75 +368,117 @@ extension CtcKeywordSpotter {
 
         let vocabSize: Int
         let timeSteps: Int
-        let indexBuilder: (Int, Int) -> [NSNumber]
+        let timeStride: Int
+        let vocabularyStride: Int
 
         if rank == 3 {
             // Expected shape: [1, timeSteps, vocabSize]
             timeSteps = ctcOutput.shape[1].intValue
             vocabSize = ctcOutput.shape[2].intValue
-            indexBuilder = { t, v in [0, t, v].map { NSNumber(value: $0) } }
+            timeStride = ctcOutput.strides[1].intValue
+            vocabularyStride = ctcOutput.strides[2].intValue
         } else {
             // Expected shape: [1, vocabSize, 1, timeSteps]
             vocabSize = ctcOutput.shape[1].intValue
             timeSteps = ctcOutput.shape[3].intValue
-            indexBuilder = { t, v in [0, v, 0, t].map { NSNumber(value: $0) } }
+            timeStride = ctcOutput.strides[3].intValue
+            vocabularyStride = ctcOutput.strides[1].intValue
         }
 
         if vocabSize <= 0 || timeSteps <= 0 {
             return []
         }
 
-        var logProbs: [[Float]] = Array(
-            repeating: Array(repeating: 0, count: vocabSize),
-            count: timeSteps
-        )
+        let rawValues = try copyFloatValues(from: ctcOutput)
+        let inverseTemperature: Float = temperature != 1.0 ? 1.0 / temperature : 1.0
+        var logProbs: [[Float]] = []
+        logProbs.reserveCapacity(timeSteps)
 
-        // Iterate over time/vocab dimensions, read logits or log-probabilities.
-        // Apply log-softmax per frame when needed.
+        // Apply log-softmax directly from the strided Core ML buffer. This avoids
+        // allocating and copying an intermediate logits array for every frame.
         for t in 0..<timeSteps {
-            var logits = [Float](repeating: 0, count: vocabSize)
-
+            let timeOffset = t * timeStride
+            var maxLogit = -Float.infinity
             for v in 0..<vocabSize {
-                logits[v] = ctcOutput[indexBuilder(t, v)].floatValue
+                let value = rawValues[timeOffset + v * vocabularyStride] * inverseTemperature
+                maxLogit = max(maxLogit, value)
             }
 
-            var row = logSoftmax(logits, temperature: temperature)
+            var sumExp: Float = 0
+            for v in 0..<vocabSize {
+                let value = rawValues[timeOffset + v * vocabularyStride] * inverseTemperature
+                sumExp += expf(value - maxLogit)
+            }
+
+            let logSumExp = logf(sumExp)
+            var row = [Float](repeating: 0, count: vocabSize)
+            for v in 0..<vocabSize {
+                let value = rawValues[timeOffset + v * vocabularyStride] * inverseTemperature
+                row[v] = (value - maxLogit) - logSumExp
+            }
 
             // Apply blank bias: subtract from blank token log prob to penalize it
             if blankBias != 0.0 && blankId < row.count {
                 row[blankId] -= blankBias
             }
 
-            logProbs[t] = row
+            logProbs.append(row)
         }
 
         return logProbs
     }
 
-    private func logSoftmax(_ logits: [Float], temperature: Float = 1.0) -> [Float] {
-        guard !logits.isEmpty else { return [] }
+    /// Copy a Core ML output once, avoiding boxed NSNumber subscripting for every value.
+    private func copyFloatValues(from array: MLMultiArray) throws -> [Float] {
+        // Core ML may pad an axis (for example vocab 1025 to stride 192).
+        // `count` excludes that padding, while stride-based offsets include it.
+        let shape = array.shape.map(\.intValue)
+        let strides = array.strides.map(\.intValue)
+        let count = zip(shape, strides).reduce(1) { partial, dimension in
+            partial + max(0, dimension.0 - 1) * dimension.1
+        }
+        var values = [Float](repeating: 0, count: count)
 
-        // Apply temperature scaling: divide logits by temperature before softmax
-        // Higher temperature = softer distribution (spreads probability mass)
-        // Lower temperature = sharper distribution (more peaked)
-        let scaledLogits = temperature != 1.0 ? logits.map { $0 / temperature } : logits
-
-        let maxLogit = scaledLogits.max() ?? 0
-        var sumExp: Float = 0
-
-        for i in 0..<scaledLogits.count {
-            sumExp += expf(scaledLogits[i] - maxLogit)
+        switch array.dataType {
+        case .float16:
+            let source = array.dataPointer.bindMemory(to: UInt16.self, capacity: count)
+            let conversionError = values.withUnsafeMutableBufferPointer { destinationBuffer -> vImage_Error in
+                guard let destination = destinationBuffer.baseAddress else { return kvImageNullPointerArgument }
+                var sourceImage = vImage_Buffer(
+                    data: source,
+                    height: 1,
+                    width: vImagePixelCount(count),
+                    rowBytes: count * MemoryLayout<UInt16>.stride
+                )
+                var destinationImage = vImage_Buffer(
+                    data: destination,
+                    height: 1,
+                    width: vImagePixelCount(count),
+                    rowBytes: count * MemoryLayout<Float>.stride
+                )
+                return vImageConvert_Planar16FtoPlanarF(&sourceImage, &destinationImage, 0)
+            }
+            guard conversionError == kvImageNoError else {
+                throw ASRError.processingFailed(
+                    "Failed to convert CTC output to Float32 (vImage error \(conversionError))"
+                )
+            }
+        case .float32:
+            let source = array.dataPointer.bindMemory(to: Float.self, capacity: count)
+            values.withUnsafeMutableBufferPointer { destination in
+                guard let destinationBase = destination.baseAddress else { return }
+                destinationBase.update(from: source, count: count)
+            }
+        case .double:
+            let source = array.dataPointer.bindMemory(to: Double.self, capacity: count)
+            for index in 0..<count {
+                values[index] = Float(source[index])
+            }
+        default:
+            throw ASRError.processingFailed("Unsupported CTC output type: \(array.dataType.rawValue)")
         }
 
-        let logSumExp = logf(sumExp)
-        var result: [Float] = Array(repeating: 0, count: scaledLogits.count)
-
-        // log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))
-        for i in 0..<scaledLogits.count {
-            result[i] = (scaledLogits[i] - maxLogit) - logSumExp
-        }
-
-        return result
+        return values
     }
 
     private func trimLogProbs(_ logProbs: [[Float]], audioSampleCount: Int) -> [[Float]] {

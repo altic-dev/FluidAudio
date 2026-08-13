@@ -33,6 +33,21 @@ extension VocabularyRescorer {
         cbw: Float,
         marginSeconds: Double
     ) -> CTCMatchResult {
+        if candidate.spanLength == 1,
+           Self.differsOnlyByInflection(
+               original: candidate.originalPhrase,
+               vocabulary: candidate.vocabTerm
+           )
+        {
+            return CTCMatchResult(
+                shouldReplace: false,
+                originalScore: 0,
+                boostedVocabScore: 0,
+                replacement: candidate.vocabTerm,
+                reason: "Protected inflected transcript word"
+            )
+        }
+
         // Calculate frame window
         let marginFrames = Int(marginSeconds / frameDuration)
         let spanStartFrame = Int(candidate.spanStartTime / frameDuration)
@@ -227,9 +242,7 @@ extension VocabularyRescorer {
         minSimilarity: Float
     ) -> Float {
         let lengthRatio = Float(normalizedWord.count) / Float(vocabTerm.count)
-        if lengthRatio < ContextBiasingConstants.lengthRatioThreshold
-            && normalizedWord.count <= ContextBiasingConstants.shortWordMaxLength
-        {
+        if lengthRatio < ContextBiasingConstants.lengthRatioThreshold {
             let adjusted = max(minSimilarity, ContextBiasingConstants.shortWordSimilarity)
             if currentSimilarity >= minSimilarity {
                 debugLog(

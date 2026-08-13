@@ -205,7 +205,8 @@ public actor ParakeetIncrementalSession {
             result = try await manager.transcribeWithState(
                 state.retainedSamples,
                 source: source,
-                applyVocabularyBoosting: false
+                applyVocabularyBoosting: false,
+                isolatedDecoderState: true
             )
         } else {
             try await processStableWindows()

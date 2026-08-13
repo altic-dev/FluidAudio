@@ -94,6 +94,39 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
         XCTAssertEqual(VocabularyRescorer.normalizeForSimilarity("hello\tworld\nfoo"), "hello world foo")
     }
 
+    func testExactPhraseContainedOnWordBoundaries() {
+        XCTAssertTrue(
+            VocabularyRescorer.containsExactNormalizedPhrase("jensen huang", in: "jensen huang ceo")
+        )
+        XCTAssertTrue(
+            VocabularyRescorer.containsExactNormalizedPhrase("jensen huang", in: "meet jensen huang")
+        )
+    }
+
+    func testExactPhraseDoesNotMatchPartialWords() {
+        XCTAssertFalse(
+            VocabularyRescorer.containsExactNormalizedPhrase("jensen huang", in: "jensen huangson ceo")
+        )
+        XCTAssertFalse(
+            VocabularyRescorer.containsExactNormalizedPhrase("jensen huang", in: "jensen")
+        )
+    }
+
+    func testInflectionGuardProtectsTranscriptSuffixes() {
+        XCTAssertTrue(
+            VocabularyRescorer.differsOnlyByInflection(original: "accelerated", vocabulary: "Accelerate")
+        )
+        XCTAssertTrue(
+            VocabularyRescorer.differsOnlyByInflection(original: "tensors", vocabulary: "Tensor")
+        )
+        XCTAssertFalse(
+            VocabularyRescorer.differsOnlyByInflection(original: "Cerebrus", vocabulary: "Cerebras")
+        )
+        XCTAssertFalse(
+            VocabularyRescorer.differsOnlyByInflection(original: "NVIDIA", vocabulary: "NVIDIA")
+        )
+    }
+
     // MARK: - Config Adaptive Thresholds
 
     func testAdaptiveCbwAtReference() {

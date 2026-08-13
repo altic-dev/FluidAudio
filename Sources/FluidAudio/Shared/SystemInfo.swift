@@ -84,6 +84,30 @@ public enum SystemInfo {
         await SystemInfoReporter.shared.logIfNeeded(logger: logger)
     }
 
+    /// Returns memory currently available to this process, if supported by the OS.
+    public static func availableMemoryBytes() -> UInt64? {
+        #if os(macOS)
+        var statistics = vm_statistics64()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &statistics) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        var pageSize: vm_size_t = 0
+        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS else { return nil }
+        let availablePages = UInt64(statistics.free_count) + UInt64(statistics.inactive_count)
+        return availablePages * UInt64(pageSize)
+        #elseif os(iOS) || os(tvOS) || os(watchOS)
+        UInt64(os_proc_available_memory())
+        #else
+        nil
+        #endif
+    }
+
     #if canImport(Darwin)
     /// Returns the current resident memory usage for this process, if available.
     public static func currentResidentMemoryBytes() -> UInt64? {
