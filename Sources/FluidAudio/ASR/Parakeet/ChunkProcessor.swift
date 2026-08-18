@@ -11,12 +11,6 @@ struct ChunkProcessor {
 
     private let logger = AppLogger(category: "ChunkProcessor")
     private typealias TokenWindow = AsrChunkTokenMerger.TokenWindow
-    private struct TaskResult: Sendable {
-        let index: Int
-        let tokens: [TokenWindow]
-        let workerIndex: Int
-        let chunkEnd: Int
-    }
     private let layout = ParakeetChunkLayout.standard
     private var sampleRate: Int { layout.sampleRate }
     private var overlapSeconds: Double { layout.overlapSeconds }
@@ -48,19 +42,9 @@ struct ChunkProcessor {
             physicalMemoryBytes: physicalMemoryBytes,
             availableMemoryBytes: availableMemoryBytes
         )
-        let workerConcurrency = Self.effectiveWorkerConcurrency(
-            configuredConcurrency: await manager.parallelChunkConcurrency,
-            environmentMode: pipelineMode,
-            physicalMemoryBytes: physicalMemoryBytes,
-            availableMemoryBytes: availableMemoryBytes
-        )
-        let hybridPipeliningEnabled =
-            pipelineMode?.lowercased() == "hybrid" && pipeliningEnabled && workerConcurrency > 1
         let chunkOutputs = try await processChunks(
             using: manager,
             pipeliningEnabled: pipeliningEnabled,
-            hybridPipeliningEnabled: hybridPipeliningEnabled,
-            workerConcurrency: workerConcurrency,
             progressHandler: progressHandler
         )
 
@@ -113,51 +97,19 @@ struct ChunkProcessor {
         guard supportsPipelining else { return false }
 
         switch environmentMode?.lowercased() {
-        case "pipeline", "hybrid":
+        case "pipeline":
             return true
-        case "serial", "workers":
+        case "serial":
             return false
         default:
             let hasPhysicalHeadroom =
                 physicalMemoryBytes >= automaticPipelineMinimumPhysicalMemoryBytes
-            let hasAvailableHeadroom = availableMemoryBytes.map {
-                $0 >= automaticPipelineMinimumAvailableMemoryBytes
-            } ?? true
+            let hasAvailableHeadroom =
+                availableMemoryBytes.map {
+                    $0 >= automaticPipelineMinimumAvailableMemoryBytes
+                } ?? false
             return hasPhysicalHeadroom && hasAvailableHeadroom
         }
-    }
-
-    static func effectiveWorkerConcurrency(
-        configuredConcurrency: Int,
-        environmentMode: String?,
-        physicalMemoryBytes: UInt64,
-        availableMemoryBytes: UInt64?
-    ) -> Int {
-        let configured = max(1, configuredConcurrency)
-        switch environmentMode?.lowercased() {
-        case "serial":
-            return 1
-        case "workers", "hybrid":
-            return configured
-        default:
-            break
-        }
-
-        let gibibyte = UInt64(1_024 * 1_024 * 1_024)
-        if let availableMemoryBytes, availableMemoryBytes < 4 * gibibyte {
-            return 1
-        }
-        if physicalMemoryBytes <= 8 * gibibyte
-            || availableMemoryBytes.map({ $0 < 6 * gibibyte }) == true
-        {
-            return min(configured, 2)
-        }
-        if physicalMemoryBytes <= 16 * gibibyte
-            || availableMemoryBytes.map({ $0 < 8 * gibibyte }) == true
-        {
-            return min(configured, 3)
-        }
-        return configured
     }
 
     private typealias ChunkWork = ParakeetChunkWork
@@ -165,314 +117,18 @@ struct ChunkProcessor {
     private func processChunks(
         using manager: AsrManager,
         pipeliningEnabled: Bool,
-        hybridPipeliningEnabled: Bool,
-        workerConcurrency: Int,
         progressHandler: ((Double) async -> Void)?
     ) async throws -> [[TokenWindow]] {
-        if hybridPipeliningEnabled,
-            let workers = await makeWorkerPool(using: manager, count: workerConcurrency)
-        {
-            return try await processChunksHybridPipelined(
-                using: workers,
-                progressHandler: progressHandler
-            )
-        }
-
         if pipeliningEnabled {
             return try await processChunksPipelined(
                 using: manager,
                 progressHandler: progressHandler
             )
         }
-
-        if workerConcurrency > 1,
-            let workers = await makeWorkerPool(using: manager, count: workerConcurrency)
-        {
-            return try await processChunksParallel(
-                using: workers,
-                progressHandler: progressHandler
-            )
-        }
-
         return try await processChunksSerial(
             using: manager,
             progressHandler: progressHandler
         )
-    }
-
-    private func processChunksHybridPipelined(
-        using workers: [AsrManager],
-        progressHandler: ((Double) async -> Void)?
-    ) async throws -> [[TokenWindow]] {
-        let chunkCount = totalSamples > 0 ? ((totalSamples - 1) / strideSamples) + 1 : 0
-        guard chunkCount > 0 else { return [] }
-
-        var chunkOutputs = Array<[TokenWindow]?>(repeating: nil, count: chunkCount)
-        var completedThroughChunkEnd = 0
-
-        try await withThrowingTaskGroup(of: [TaskResult].self) { group in
-            for workerIndex in workers.indices where workerIndex < chunkCount {
-                let worker = workers[workerIndex]
-                group.addTask {
-                    try await processChunkLanePipelined(
-                        using: worker,
-                        workerIndex: workerIndex,
-                        firstChunkIndex: workerIndex,
-                        chunkIndexStride: workers.count
-                    )
-                }
-            }
-
-            for try await laneResults in group {
-                for result in laneResults {
-                    chunkOutputs[result.index] = result.tokens
-                    completedThroughChunkEnd = max(completedThroughChunkEnd, result.chunkEnd)
-                }
-                if let progressHandler, completedThroughChunkEnd < totalSamples {
-                    await progressHandler(
-                        min(1.0, max(0.0, Double(completedThroughChunkEnd) / Double(totalSamples)))
-                    )
-                }
-            }
-        }
-
-        return try chunkOutputs.enumerated().map { index, output in
-            guard let output else {
-                throw ASRError.processingFailed("Missing hybrid Parakeet output for chunk \(index)")
-            }
-            return output
-        }
-    }
-
-    private func processChunkLanePipelined(
-        using manager: AsrManager,
-        workerIndex: Int,
-        firstChunkIndex: Int,
-        chunkIndexStride: Int
-    ) async throws -> [TaskResult] {
-        func work(at chunkIndex: Int) throws -> ChunkWork? {
-            try makeChunkWork(
-                chunkStart: chunkIndex * strideSamples,
-                chunkIndex: chunkIndex
-            )
-        }
-
-        guard var currentWork = try work(at: firstChunkIndex) else { return [] }
-
-        var results: [TaskResult] = []
-        var currentChunkIndex = firstChunkIndex
-        var decoderState = TdtDecoderState.make(decoderLayers: await manager.getDecoderLayers())
-        var currentEncoderTask: Task<PreparedParakeetEncoderHandle, Error>?
-        var lookaheadWork: ChunkWork?
-        var lookaheadChunkIndex: Int?
-        var lookaheadPreprocessorTask: Task<PreparedParakeetPreprocessorHandle, Error>?
-
-        while true {
-            var currentEncoder: PreparedParakeetEncoderHandle?
-            var initialPreprocessor: PreparedParakeetPreprocessorHandle?
-            var lookaheadPreprocessor: PreparedParakeetPreprocessorHandle?
-            var followingWork: ChunkWork?
-            var followingChunkIndex: Int?
-            var followingPreprocessorTask: Task<PreparedParakeetPreprocessorHandle, Error>?
-            var nextEncoderTask: Task<PreparedParakeetEncoderHandle, Error>?
-
-            do {
-                try Task.checkCancellation()
-                if let currentEncoderTask {
-                    currentEncoder = try await currentEncoderTask.value
-                } else {
-                    initialPreprocessor = try await manager.prepareParakeetPreprocessorOutput(
-                        currentWork.paddedSamples,
-                        originalLength: currentWork.samples.count,
-                        snapshotOutput: true
-                    )
-                    let nextChunkIndex = currentChunkIndex + chunkIndexStride
-                    lookaheadWork = try work(at: nextChunkIndex)
-                    lookaheadChunkIndex = lookaheadWork == nil ? nil : nextChunkIndex
-                    lookaheadPreprocessorTask =
-                        lookaheadWork.map { makePreprocessorTask(for: $0, using: manager) }
-                    guard let initialPreprocessor else {
-                        throw ASRError.processingFailed("Initial hybrid preprocessor output is unavailable")
-                    }
-                    currentEncoder = try await manager.prepareParakeetEncoderOutput(
-                        preparedPreprocessor: initialPreprocessor,
-                        snapshotOutput: true
-                    )
-                }
-
-                if lookaheadWork != nil, let lookaheadChunkIndex {
-                    guard let lookaheadPreprocessorTask else {
-                        throw ASRError.processingFailed("Hybrid lookahead preprocessor task is unavailable")
-                    }
-                    lookaheadPreprocessor = try await lookaheadPreprocessorTask.value
-                    let nextChunkIndex = lookaheadChunkIndex + chunkIndexStride
-                    followingWork = try work(at: nextChunkIndex)
-                    followingChunkIndex = followingWork == nil ? nil : nextChunkIndex
-                    followingPreprocessorTask =
-                        followingWork.map { makePreprocessorTask(for: $0, using: manager) }
-                    guard let lookaheadPreprocessor else {
-                        throw ASRError.processingFailed("Hybrid lookahead preprocessor output is unavailable")
-                    }
-                    nextEncoderTask = makeEncoderTask(for: lookaheadPreprocessor, using: manager)
-                }
-
-                guard let currentEncoder else {
-                    throw ASRError.processingFailed("Hybrid encoder output is unavailable")
-                }
-                decoderState.reset()
-                let output = try await transcribeChunk(
-                    work: currentWork,
-                    preparedEncoder: currentEncoder,
-                    using: manager,
-                    decoderState: &decoderState
-                )
-                results.append(
-                    TaskResult(
-                        index: currentChunkIndex,
-                        tokens: try ParakeetChunkInference.makeTokenWindow(from: output),
-                        workerIndex: workerIndex,
-                        chunkEnd: currentWork.chunkEnd
-                    )
-                )
-            } catch {
-                if let initialPreprocessor {
-                    await manager.discardParakeetPreprocessorOutput(initialPreprocessor)
-                }
-                if let lookaheadPreprocessor {
-                    await manager.discardParakeetPreprocessorOutput(lookaheadPreprocessor)
-                }
-                if let currentEncoder {
-                    await manager.discardParakeetEncoderOutput(currentEncoder)
-                }
-                await discardPreprocessorTask(lookaheadPreprocessorTask, using: manager)
-                await discardPreprocessorTask(followingPreprocessorTask, using: manager)
-                await discardEncoderTask(currentEncoderTask, using: manager)
-                await discardEncoderTask(nextEncoderTask, using: manager)
-                throw error
-            }
-
-            guard let nextWork = lookaheadWork, let nextChunkIndex = lookaheadChunkIndex else {
-                break
-            }
-            currentWork = nextWork
-            currentChunkIndex = nextChunkIndex
-            currentEncoderTask = nextEncoderTask
-            lookaheadWork = followingWork
-            lookaheadChunkIndex = followingChunkIndex
-            lookaheadPreprocessorTask = followingPreprocessorTask
-        }
-
-        return results
-    }
-
-    private func processChunksParallel(
-        using workers: [AsrManager],
-        progressHandler: ((Double) async -> Void)?
-    ) async throws -> [[TokenWindow]] {
-        guard var currentWork = try makeChunkWork(chunkStart: 0, chunkIndex: 0) else {
-            return []
-        }
-
-        let decoderLayers = await workers[0].getDecoderLayers()
-        var chunkOutputs: [[TokenWindow]?] = []
-        var availableWorkers = Array(workers.indices)
-        var inFlight = 0
-        var chunkIndex = 0
-        var completedThroughChunkEnd = 0
-
-        func collectNextResult(
-            _ group: inout ThrowingTaskGroup<TaskResult, Error>
-        ) async throws {
-            guard inFlight > 0, let finished = try await group.next() else { return }
-            chunkOutputs[finished.index] = finished.tokens
-            availableWorkers.append(finished.workerIndex)
-            inFlight -= 1
-            completedThroughChunkEnd = max(completedThroughChunkEnd, finished.chunkEnd)
-
-            if let progressHandler, completedThroughChunkEnd < totalSamples {
-                let progress = min(
-                    1.0,
-                    max(0.0, Double(completedThroughChunkEnd) / Double(totalSamples))
-                )
-                await progressHandler(progress)
-            }
-        }
-
-        try await withThrowingTaskGroup(of: TaskResult.self) { group in
-            while true {
-                try Task.checkCancellation()
-                if availableWorkers.isEmpty {
-                    try await collectNextResult(&group)
-                }
-
-                guard !availableWorkers.isEmpty else {
-                    throw ASRError.processingFailed("No Parakeet chunk worker is available")
-                }
-
-                let workerIndex = availableWorkers.removeFirst()
-                let worker = workers[workerIndex]
-                let work = currentWork
-                let index = chunkIndex
-                chunkOutputs.append(nil)
-
-                group.addTask {
-                    var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
-                    decoderState.reset()
-                    let tokens = try await ParakeetChunkInference.transcribe(
-                        work: work,
-                        using: worker,
-                        decoderState: &decoderState
-                    )
-                    return TaskResult(
-                        index: index,
-                        tokens: tokens,
-                        workerIndex: workerIndex,
-                        chunkEnd: work.chunkEnd
-                    )
-                }
-                inFlight += 1
-
-                if work.isLastChunk {
-                    break
-                }
-
-                chunkIndex += 1
-                guard
-                    let nextWork = try makeChunkWork(
-                        chunkStart: work.chunkStart + strideSamples,
-                        chunkIndex: chunkIndex
-                    )
-                else {
-                    break
-                }
-                currentWork = nextWork
-            }
-
-            while inFlight > 0 {
-                try Task.checkCancellation()
-                try await collectNextResult(&group)
-            }
-        }
-
-        return try chunkOutputs.enumerated().map { index, output in
-            guard let output else {
-                throw ASRError.processingFailed("Missing Parakeet output for chunk \(index)")
-            }
-            return output
-        }
-    }
-
-    private func makeWorkerPool(using manager: AsrManager, count: Int) async -> [AsrManager]? {
-        guard count > 0 else { return nil }
-        var workers = [manager]
-        guard count > 1 else { return workers }
-
-        for _ in 1..<count {
-            guard let worker = await manager.makeWorkerClone() else { return nil }
-            workers.append(worker)
-        }
-        logger.debug("ChunkProcessor using worker pool of size \(workers.count)")
-        return workers
     }
 
     private func processChunksSerial(

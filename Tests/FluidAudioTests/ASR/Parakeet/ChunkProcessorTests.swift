@@ -48,14 +48,6 @@ final class ChunkProcessorTests: XCTestCase {
                 availableMemoryBytes: 2 * 1_024 * 1_024 * 1_024
             )
         )
-        XCTAssertTrue(
-            ChunkProcessor.shouldPipelineFrontend(
-                environmentMode: "hybrid",
-                supportsPipelining: true,
-                physicalMemoryBytes: 8 * 1_024 * 1_024 * 1_024,
-                availableMemoryBytes: 2 * 1_024 * 1_024 * 1_024
-            )
-        )
     }
 
     func testFrontendPipeliningDefaultsOffWithoutMemoryHeadroom() {
@@ -75,12 +67,20 @@ final class ChunkProcessorTests: XCTestCase {
                 availableMemoryBytes: 4 * 1_024 * 1_024 * 1_024
             )
         )
-    }
-
-    func testFrontendPipeliningCanBeForcedOffForWorkers() {
         XCTAssertFalse(
             ChunkProcessor.shouldPipelineFrontend(
-                environmentMode: "workers",
+                environmentMode: nil,
+                supportsPipelining: true,
+                physicalMemoryBytes: 32 * 1_024 * 1_024 * 1_024,
+                availableMemoryBytes: nil
+            )
+        )
+    }
+
+    func testFrontendPipeliningCanBeForcedOff() {
+        XCTAssertFalse(
+            ChunkProcessor.shouldPipelineFrontend(
+                environmentMode: "serial",
                 supportsPipelining: true,
                 physicalMemoryBytes: 128 * 1_024 * 1_024 * 1_024,
                 availableMemoryBytes: 64 * 1_024 * 1_024 * 1_024
@@ -96,68 +96,6 @@ final class ChunkProcessorTests: XCTestCase {
                 physicalMemoryBytes: 128 * 1_024 * 1_024 * 1_024,
                 availableMemoryBytes: 64 * 1_024 * 1_024 * 1_024
             )
-        )
-    }
-
-    func testWorkerConcurrencyScalesDownWithMemory() {
-        let gibibyte = UInt64(1_024 * 1_024 * 1_024)
-        XCTAssertEqual(
-            ChunkProcessor.effectiveWorkerConcurrency(
-                configuredConcurrency: 4,
-                environmentMode: nil,
-                physicalMemoryBytes: 8 * gibibyte,
-                availableMemoryBytes: 5 * gibibyte
-            ),
-            2
-        )
-        XCTAssertEqual(
-            ChunkProcessor.effectiveWorkerConcurrency(
-                configuredConcurrency: 4,
-                environmentMode: nil,
-                physicalMemoryBytes: 16 * gibibyte,
-                availableMemoryBytes: 10 * gibibyte
-            ),
-            3
-        )
-        XCTAssertEqual(
-            ChunkProcessor.effectiveWorkerConcurrency(
-                configuredConcurrency: 4,
-                environmentMode: nil,
-                physicalMemoryBytes: 32 * gibibyte,
-                availableMemoryBytes: 16 * gibibyte
-            ),
-            4
-        )
-        XCTAssertEqual(
-            ChunkProcessor.effectiveWorkerConcurrency(
-                configuredConcurrency: 3,
-                environmentMode: "hybrid",
-                physicalMemoryBytes: 8 * gibibyte,
-                availableMemoryBytes: 2 * gibibyte
-            ),
-            3
-        )
-    }
-
-    func testWorkerConcurrencyOverridesAreDeterministic() {
-        let gibibyte = UInt64(1_024 * 1_024 * 1_024)
-        XCTAssertEqual(
-            ChunkProcessor.effectiveWorkerConcurrency(
-                configuredConcurrency: 4,
-                environmentMode: "serial",
-                physicalMemoryBytes: 128 * gibibyte,
-                availableMemoryBytes: 64 * gibibyte
-            ),
-            1
-        )
-        XCTAssertEqual(
-            ChunkProcessor.effectiveWorkerConcurrency(
-                configuredConcurrency: 4,
-                environmentMode: "workers",
-                physicalMemoryBytes: 8 * gibibyte,
-                availableMemoryBytes: 2 * gibibyte
-            ),
-            4
         )
     }
 
