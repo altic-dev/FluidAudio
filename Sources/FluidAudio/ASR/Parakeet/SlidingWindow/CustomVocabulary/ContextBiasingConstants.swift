@@ -120,11 +120,12 @@ public enum ContextBiasingConstants {
 
     /// Similarity threshold for short words with low length ratio.
     ///
-    /// Short common words (≤4 chars) with low length ratio need very high
-    /// similarity to replace, preventing "you" → "Yu", "or" → "VR".
+    /// Words with low length ratio need very high similarity to replace,
+    /// preventing both short false positives and substring hijacking such as
+    /// "inference" → "FluidInference".
     ///
     /// - Value: `0.80` (80% similarity for short words)
-    /// - Applies when: `word.count <= 4` AND `lengthRatio < 0.75`
+    /// - Applies when: `lengthRatio < 0.75`
     /// - Used in: `VocabularyRescorer+ConstrainedCTC.swift` short word guard
     public static let shortWordSimilarity: Float = 0.80
 
@@ -197,11 +198,16 @@ public enum ContextBiasingConstants {
     /// - Parameter size: Number of vocabulary terms.
     /// - Returns: `VocabSizeConfig` with appropriate thresholds.
     public static func rescorerConfig(forVocabSize size: Int) -> VocabSizeConfig {
-        let isLarge = size > largeVocabThreshold
-        return VocabSizeConfig(
-            minSimilarity: isLarge ? 0.60 : 0.50,
-            cbw: isLarge ? 2.5 : 3.0
-        )
+        switch size {
+        case ...largeVocabThreshold:
+            return VocabSizeConfig(minSimilarity: 0.50, cbw: 3.0)
+        case 11..<50:
+            return VocabSizeConfig(minSimilarity: 0.60, cbw: 2.5)
+        case 50..<100:
+            return VocabSizeConfig(minSimilarity: 0.80, cbw: 2.0)
+        default:
+            return VocabSizeConfig(minSimilarity: 0.85, cbw: 1.75)
+        }
     }
 
     /// Baseline token count for multi-token phrase threshold adjustment.

@@ -120,6 +120,33 @@ extension VocabularyRescorer {
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Whether a normalized phrase contains another normalized phrase on whole-word boundaries.
+    static func containsExactNormalizedPhrase(_ target: String, in candidate: String) -> Bool {
+        let targetWords = target.split(separator: " ")
+        let candidateWords = candidate.split(separator: " ")
+        guard !targetWords.isEmpty, targetWords.count <= candidateWords.count else { return false }
+
+        for start in 0...(candidateWords.count - targetWords.count) {
+            if candidateWords[start..<(start + targetWords.count)].elementsEqual(targetWords) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Protect a correctly inflected transcript word from being shortened to a
+    /// vocabulary stem (for example, "accelerated" -> "Accelerate").
+    static func differsOnlyByInflection(original: String, vocabulary: String) -> Bool {
+        let original = normalizeForSimilarity(original)
+        let vocabulary = normalizeForSimilarity(vocabulary)
+        guard !original.contains(" "), !vocabulary.contains(" "), original != vocabulary else {
+            return false
+        }
+
+        let suffixes = ["s", "es", "d", "ed", "ing", "ly", "er", "est"]
+        return suffixes.contains { original == vocabulary + $0 }
+    }
+
     /// Build set of normalized vocabulary terms for guard checks
     func buildVocabularyNormalizedSet() -> Set<String> {
         var normalizedSet = Set<String>()

@@ -18,6 +18,7 @@ struct ParakeetPreprocessorOutput {
 
 struct ParakeetEncoderOutput {
     let encoderOutput: MLFeatureProvider
+    let ownedBackings: [MLMultiArray]
 }
 
 extension AsrManager {
@@ -26,20 +27,28 @@ extension AsrManager {
     }
 
     internal func transcribeWithState(
-        _ audioSamples: [Float], source: AudioSource
+        _ audioSamples: [Float],
+        source: AudioSource,
+        applyVocabularyBoosting: Bool = true,
+        isolatedDecoderState: Bool = false
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
         guard audioSamples.count >= 16_000 else { throw ASRError.invalidAudioData }
 
         let startTime = Date()
 
-        // Get the appropriate decoder state
+        // Incremental previews reprocess the same short utterance from sample zero, so they must
+        // not inherit decoder context from an earlier preview or another session.
         var decoderState: TdtDecoderState
-        switch source {
-        case .microphone:
-            decoderState = microphoneDecoderState
-        case .system:
-            decoderState = systemDecoderState
+        if isolatedDecoderState {
+            decoderState = TdtDecoderState.make(decoderLayers: getDecoderLayers())
+        } else {
+            switch source {
+            case .microphone:
+                decoderState = microphoneDecoderState
+            case .system:
+                decoderState = systemDecoderState
+            }
         }
 
         // Route to appropriate processing method based on audio length
@@ -76,16 +85,17 @@ extension AsrManager {
             )
 
             // Auto-apply vocabulary rescoring when configured
-            if vocabBoostingEnabled {
+            if applyVocabularyBoosting, vocabBoostingEnabled {
                 result = await applyVocabularyRescoring(result: result, audioSamples: audioSamples)
             }
 
-            // Store decoder state back
-            switch source {
-            case .microphone:
-                microphoneDecoderState = decoderState
-            case .system:
-                systemDecoderState = decoderState
+            if !isolatedDecoderState {
+                switch source {
+                case .microphone:
+                    microphoneDecoderState = decoderState
+                case .system:
+                    systemDecoderState = decoderState
+                }
             }
 
             return result
@@ -103,16 +113,17 @@ extension AsrManager {
         )
 
         // Auto-apply vocabulary rescoring when configured
-        if vocabBoostingEnabled {
+        if applyVocabularyBoosting, vocabBoostingEnabled {
             result = await applyVocabularyRescoring(result: result, audioSamples: audioSamples)
         }
 
-        // Store decoder state back (ChunkProcessor uses the stored state directly)
-        switch source {
-        case .microphone:
-            microphoneDecoderState = decoderState
-        case .system:
-            systemDecoderState = decoderState
+        if !isolatedDecoderState {
+            switch source {
+            case .microphone:
+                microphoneDecoderState = decoderState
+            case .system:
+                systemDecoderState = decoderState
+            }
         }
 
         return result
@@ -148,7 +159,8 @@ extension AsrManager {
 
     func prepareParakeetPreprocessorOutput(
         _ paddedAudio: [Float],
-        originalLength: Int?
+        originalLength: Int?,
+        snapshotOutput: Bool = false
     ) async throws -> PreparedParakeetPreprocessorHandle {
         let preprocessorInput = try await preparePreprocessorInput(
             paddedAudio, actualLength: originalLength
@@ -166,11 +178,15 @@ extension AsrManager {
                 from: preprocessorInput,
                 options: predictionOptions
             )
+            let storedOutput =
+                snapshotOutput
+                ? try Self.snapshotFeatureProvider(preprocessorOutput)
+                : preprocessorOutput
 
             let handle = PreparedParakeetPreprocessorHandle(id: UUID())
             preparedParakeetPreprocessorOutputs[handle.id] = ParakeetPreprocessorOutput(
                 input: preprocessorInput,
-                output: preprocessorOutput,
+                output: storedOutput,
                 audioArray: preprocessorAudioArray
             )
             return handle
@@ -183,12 +199,14 @@ extension AsrManager {
     }
 
     func prepareParakeetEncoderOutput(
-        preparedPreprocessor handle: PreparedParakeetPreprocessorHandle
+        preparedPreprocessor handle: PreparedParakeetPreprocessorHandle,
+        snapshotOutput: Bool = false
     ) async throws -> PreparedParakeetEncoderHandle {
         guard let preparedOutput = preparedParakeetPreprocessorOutputs.removeValue(forKey: handle.id) else {
             throw ASRError.processingFailed("Prepared preprocessor output is unavailable")
         }
 
+        var ownedBackings: [MLMultiArray] = []
         do {
             let encoderOutputProvider: MLFeatureProvider
             if let encoderModel {
@@ -199,9 +217,19 @@ extension AsrManager {
                 )
 
                 try Task.checkCancellation()
+                let encoderPredictionOptions: MLPredictionOptions
+                if snapshotOutput {
+                    let backings = try await makeOutputBackings(for: encoderModel)
+                    let options = AsrModels.optimizedPredictionOptions()
+                    options.outputBackings = backings
+                    encoderPredictionOptions = options
+                    ownedBackings = Array(backings.values)
+                } else {
+                    encoderPredictionOptions = predictionOptions
+                }
                 encoderOutputProvider = try await encoderModel.compatPrediction(
                     from: encoderInput,
-                    options: predictionOptions
+                    options: encoderPredictionOptions
                 )
             } else {
                 encoderOutputProvider = preparedOutput.output
@@ -213,10 +241,12 @@ extension AsrManager {
 
             let encoderHandle = PreparedParakeetEncoderHandle(id: UUID())
             preparedParakeetEncoderOutputs[encoderHandle.id] = ParakeetEncoderOutput(
-                encoderOutput: encoderOutputProvider
+                encoderOutput: encoderOutputProvider,
+                ownedBackings: ownedBackings
             )
             return encoderHandle
         } catch {
+            await returnEncoderOutputBackings(ownedBackings)
             if let preprocessorAudioArray = preparedOutput.audioArray {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
@@ -272,21 +302,100 @@ extension AsrManager {
                 globalFrameOffset: globalFrameOffset
             )
 
+            await returnEncoderOutputBackings(preparedOutput.ownedBackings)
             return (hypothesis, encoderSequenceLength)
+        } catch {
+            await returnEncoderOutputBackings(preparedOutput.ownedBackings)
+            throw error
         }
     }
 
     func discardParakeetPreprocessorOutput(_ handle: PreparedParakeetPreprocessorHandle) async {
-        guard let preparedOutput = preparedParakeetPreprocessorOutputs.removeValue(forKey: handle.id),
-            let audioArray = preparedOutput.audioArray
-        else {
+        guard let preparedOutput = preparedParakeetPreprocessorOutputs.removeValue(forKey: handle.id) else {
             return
         }
-        await sharedMLArrayCache.returnArray(audioArray)
+        if let audioArray = preparedOutput.audioArray {
+            await sharedMLArrayCache.returnArray(audioArray)
+        }
     }
 
-    func discardParakeetEncoderOutput(_ handle: PreparedParakeetEncoderHandle) {
-        preparedParakeetEncoderOutputs.removeValue(forKey: handle.id)
+    func discardParakeetEncoderOutput(_ handle: PreparedParakeetEncoderHandle) async {
+        guard let output = preparedParakeetEncoderOutputs.removeValue(forKey: handle.id) else {
+            return
+        }
+        await returnEncoderOutputBackings(output.ownedBackings)
+    }
+
+    private func makeOutputBackings(for model: MLModel) async throws -> [String: MLMultiArray] {
+        var backings: [String: MLMultiArray] = [:]
+        do {
+            for (name, description) in model.modelDescription.outputDescriptionsByName {
+                guard let constraint = description.multiArrayConstraint else { continue }
+                backings[name] = try await sharedMLArrayCache.getArray(
+                    shape: constraint.shape,
+                    dataType: constraint.dataType
+                )
+            }
+            guard !backings.isEmpty else {
+                throw ASRError.processingFailed("Model has no reusable multi-array outputs")
+            }
+            return backings
+        } catch {
+            await returnOutputBackings(Array(backings.values))
+            throw error
+        }
+    }
+
+    private func returnOutputBackings(_ backings: [MLMultiArray]) async {
+        for backing in backings {
+            await sharedMLArrayCache.returnArray(backing)
+        }
+    }
+
+    private static func snapshotFeatureProvider(
+        _ provider: MLFeatureProvider
+    ) throws -> MLFeatureProvider {
+        var features: [String: MLFeatureValue] = [:]
+        for name in provider.featureNames {
+            guard let value = provider.featureValue(for: name) else { continue }
+            if let array = value.multiArrayValue {
+                features[name] = MLFeatureValue(multiArray: try snapshotMultiArray(array))
+            } else {
+                features[name] = value
+            }
+        }
+        return try MLDictionaryFeatureProvider(dictionary: features)
+    }
+
+    private static func snapshotMultiArray(_ source: MLMultiArray) throws -> MLMultiArray {
+        let storageElementCount = zip(source.shape, source.strides).reduce(1) { extent, pair in
+            let (dimension, stride) = pair
+            return extent + max(0, dimension.intValue - 1) * stride.intValue
+        }
+        let byteCount = storageElementCount * ANEMemoryUtils.getElementSize(for: source.dataType)
+        let storage = UnsafeMutableRawPointer.allocate(byteCount: max(byteCount, 1), alignment: 64)
+        if byteCount > 0 {
+            memcpy(storage, source.dataPointer, byteCount)
+        }
+
+        do {
+            return try MLMultiArray(
+                dataPointer: storage,
+                shape: source.shape,
+                dataType: source.dataType,
+                strides: source.strides,
+                deallocator: { pointer in pointer.deallocate() }
+            )
+        } catch {
+            storage.deallocate()
+            throw error
+        }
+    }
+
+    private func returnEncoderOutputBackings(_ backings: [MLMultiArray]) async {
+        for backing in backings {
+            await sharedMLArrayCache.returnArray(backing)
+        }
     }
 
     private func prepareEncoderInput(
@@ -402,11 +511,12 @@ extension AsrManager {
         encoderSequenceLength: Int,
         audioSamples: [Float],
         processingTime: TimeInterval,
+        audioSampleCount: Int? = nil,
         tokenTimings: [TokenTiming] = []
     ) -> ASRResult {
 
         let (text, finalTimings) = convertTokensWithExistingTimings(tokenIds, timings: tokenTimings)
-        let duration = TimeInterval(audioSamples.count) / TimeInterval(config.sampleRate)
+        let duration = TimeInterval(audioSampleCount ?? audioSamples.count) / TimeInterval(config.sampleRate)
 
         // Convert timestamps to TokenTiming objects if provided
         let timingsFromTimestamps = createTokenTimings(
@@ -666,11 +776,7 @@ extension AsrManager {
         }
 
         do {
-            let spotResult = try await spotter.spotKeywordsWithLogProbs(
-                audioSamples: audioSamples,
-                customVocabulary: vocab,
-                minScore: nil
-            )
+            let spotResult = try await spotter.computeLogProbabilities(audioSamples: audioSamples)
 
             let logProbs = spotResult.logProbs
             guard !logProbs.isEmpty else {

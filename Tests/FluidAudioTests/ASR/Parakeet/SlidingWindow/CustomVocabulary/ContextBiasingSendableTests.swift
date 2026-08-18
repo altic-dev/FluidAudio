@@ -36,6 +36,10 @@ final class ContextBiasingSendableTests: XCTestCase {
         requiresSendable(CtcKeywordSpotter.SpotKeywordsResult.self)
     }
 
+    func testLogProbabilitiesResultIsSendable() {
+        requiresSendable(CtcKeywordSpotter.LogProbabilitiesResult.self)
+    }
+
     // MARK: - BK-Tree
 
     func testBKTreeIsSendable() {

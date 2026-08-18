@@ -49,6 +49,13 @@ public struct CtcKeywordSpotter: Sendable {
         let audioSamplesUsed: Int
     }
 
+    /// CTC log-probabilities without running vocabulary-wide keyword detection.
+    public struct LogProbabilitiesResult: Sendable {
+        public let logProbs: [[Float]]
+        public let frameDuration: Double
+        public let totalFrames: Int
+    }
+
     /// Public result type containing detections and cached CTC log-probabilities.
     /// The log-probs can be reused for scoring additional words without re-running the CTC model.
     public struct SpotKeywordsResult: Sendable {
@@ -97,6 +104,19 @@ public struct CtcKeywordSpotter: Sendable {
     }
 
     // MARK: - Public API
+
+    /// Run CTC inference without scanning every vocabulary term for global detections.
+    /// Use this when the caller will perform timestamp-constrained rescoring.
+    public func computeLogProbabilities(
+        audioSamples: [Float]
+    ) async throws -> LogProbabilitiesResult {
+        let result = try await computeLogProbs(for: audioSamples)
+        return LogProbabilitiesResult(
+            logProbs: result.logProbs,
+            frameDuration: result.frameDuration,
+            totalFrames: result.totalFrames
+        )
+    }
 
     /// Spot keywords and return both detections and cached log-probabilities.
     /// The log-probs can be reused for scoring additional words (e.g., original transcript words)

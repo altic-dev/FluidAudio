@@ -115,6 +115,9 @@ struct TranscriptionJSONOutput: Codable {
     let confidence: Float?
     let wordTimings: [WordTiming]
     let timingsConfirmed: Bool?
+    let incrementalWorkSeconds: TimeInterval?
+    let finalizationSeconds: TimeInterval?
+    let reusedWindows: Int?
 }
 
 /// Helper to merge tokens into word-level timings
@@ -214,6 +217,10 @@ enum TranscribeCommand {
         var customVocabPath: String?
         var modelDir: String?
         var parakeetVariant: StreamingModelVariant?
+        var incrementalFinalMode = false
+        var prefixPreviewFinalMode = false
+        var incrementalFeedSeconds = 0.6
+        var incrementalFinalTailSeconds = 0.0
 
         // Parse options
         var i = 1
@@ -224,6 +231,20 @@ enum TranscribeCommand {
                 exit(0)
             case "--streaming":
                 streamingMode = true
+            case "--incremental-final":
+                incrementalFinalMode = true
+            case "--prefix-preview-final":
+                prefixPreviewFinalMode = true
+            case "--feed-seconds":
+                if i + 1 < arguments.count, let value = Double(arguments[i + 1]), value > 0 {
+                    incrementalFeedSeconds = value
+                    i += 1
+                }
+            case "--final-tail-seconds":
+                if i + 1 < arguments.count, let value = Double(arguments[i + 1]), value >= 0 {
+                    incrementalFinalTailSeconds = value
+                    i += 1
+                }
             case "--metadata":
                 showMetadata = true
             case "--word-timestamps":
@@ -295,14 +316,19 @@ enum TranscribeCommand {
             await testBatchTranscription(
                 audioFile: audioFile, showMetadata: showMetadata, wordTimestamps: wordTimestamps,
                 outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath,
-                modelDir: modelDir)
+                modelDir: modelDir, incrementalFinalMode: incrementalFinalMode,
+                prefixPreviewFinalMode: prefixPreviewFinalMode,
+                incrementalFeedSeconds: incrementalFeedSeconds,
+                incrementalFinalTailSeconds: incrementalFinalTailSeconds)
         }
     }
 
     /// Test batch transcription using AsrManager directly
     private static func testBatchTranscription(
         audioFile: String, showMetadata: Bool, wordTimestamps: Bool, outputJsonPath: String?,
-        modelVersion: AsrModelVersion, customVocabPath: String?, modelDir: String? = nil
+        modelVersion: AsrModelVersion, customVocabPath: String?, modelDir: String? = nil,
+        incrementalFinalMode: Bool = false, prefixPreviewFinalMode: Bool = false,
+        incrementalFeedSeconds: Double = 0.6, incrementalFinalTailSeconds: Double = 0
     ) async {
         do {
             // Initialize ASR models
@@ -344,9 +370,72 @@ enum TranscribeCommand {
 
             // Process with ASR Manager
             logger.info("Transcribing file: \(audioFileURL) ...")
-            let startTime = Date()
-            var result = try await asrManager.transcribe(audioFileURL)
-            let processingTime = Date().timeIntervalSince(startTime)
+            let processingTime: TimeInterval
+            var transcriptionMode = "batch"
+            var incrementalWorkSeconds: TimeInterval?
+            var incrementalFinalizationSeconds: TimeInterval?
+            var incrementalReusedWindows: Int?
+            var result: ASRResult
+            if prefixPreviewFinalMode {
+                transcriptionMode = "prefix-preview-final"
+                let feedSamples = max(1, Int((incrementalFeedSeconds * 16_000).rounded()))
+                let previewStart = Date()
+                var offset = 0
+                while offset < samples.count {
+                    let end = min(offset + feedSamples, samples.count)
+                    if end >= 16_000 {
+                        _ = try await asrManager.transcribe(
+                            Array(samples[0..<end]),
+                            source: .system
+                        )
+                    }
+                    offset = end
+                }
+                incrementalWorkSeconds = Date().timeIntervalSince(previewStart)
+                let finalStart = Date()
+                result = try await asrManager.transcribe(samples, source: .system)
+                processingTime = Date().timeIntervalSince(finalStart)
+                incrementalFinalizationSeconds = processingTime
+            } else if incrementalFinalMode {
+                transcriptionMode = "incremental-final"
+                let session = try await asrManager.makeIncrementalSession(source: .system)
+                let feedSamples = max(1, Int((incrementalFeedSeconds * 16_000).rounded()))
+                let finalTailSamples = max(0, Int((incrementalFinalTailSeconds * 16_000).rounded()))
+                let previewSampleLimit = min(
+                    samples.count,
+                    max(16_000, samples.count - finalTailSamples)
+                )
+                let previewStart = Date()
+                var offset = 0
+                while offset < previewSampleLimit {
+                    let end = min(offset + feedSamples, previewSampleLimit)
+                    try await session.append(Array(samples[offset..<end]))
+                    if end >= 16_000 {
+                        _ = try await session.preview()
+                    }
+                    offset = end
+                }
+                let previewTime = Date().timeIntervalSince(previewStart)
+                let finalStart = Date()
+                if previewSampleLimit < samples.count {
+                    try await session.append(Array(samples[previewSampleLimit..<samples.count]))
+                }
+                result = try await session.finish()
+                processingTime = Date().timeIntervalSince(finalStart)
+                let finalizedWindows = await session.finalizedWindowCount
+                incrementalWorkSeconds = previewTime
+                incrementalFinalizationSeconds = processingTime
+                incrementalReusedWindows = finalizedWindows
+                logger.info(
+                    "Incremental work: \(String(format: "%.3f", previewTime))s across recording; "
+                        + "finalization: \(String(format: "%.6f", processingTime))s; "
+                        + "reused windows: \(finalizedWindows)"
+                )
+            } else {
+                let startTime = Date()
+                result = try await asrManager.transcribe(samples, source: .system)
+                processingTime = Date().timeIntervalSince(startTime)
+            }
 
             // Apply vocabulary rescoring if custom vocab is provided
             if let vocabPath = customVocabPath {
@@ -433,7 +522,7 @@ enum TranscribeCommand {
                 }
                 let output = TranscriptionJSONOutput(
                     audioFile: audioFile,
-                    mode: "batch",
+                    mode: transcriptionMode,
                     modelVersion: modelVersionLabel,
                     text: result.text,
                     durationSeconds: result.duration,
@@ -441,7 +530,10 @@ enum TranscribeCommand {
                     rtfx: result.rtfx,
                     confidence: result.confidence,
                     wordTimings: wordTimings,
-                    timingsConfirmed: nil
+                    timingsConfirmed: nil,
+                    incrementalWorkSeconds: incrementalWorkSeconds,
+                    finalizationSeconds: incrementalFinalizationSeconds,
+                    reusedWindows: incrementalReusedWindows
                 )
                 try writeJsonOutput(output, to: outputJsonPath)
                 logger.info("💾 JSON results saved to: \(outputJsonPath)")
@@ -695,7 +787,10 @@ enum TranscribeCommand {
                     rtfx: Float(finalRtfx),
                     confidence: latestUpdate?.confidence,
                     wordTimings: wordTimings,
-                    timingsConfirmed: snapshot?.isConfirmed
+                    timingsConfirmed: snapshot?.isConfirmed,
+                    incrementalWorkSeconds: nil,
+                    finalizationSeconds: nil,
+                    reusedWindows: nil
                 )
                 try writeJsonOutput(output, to: outputJsonPath)
                 logger.info("💾 JSON results saved to: \(outputJsonPath)")
@@ -857,6 +952,10 @@ enum TranscribeCommand {
             Options:
                 --help, -h         Show this help message
                 --streaming        Use streaming mode with chunk simulation
+                --incremental-final  Benchmark reusable Parakeet windows and cached finalization
+                --prefix-preview-final  Benchmark the legacy growing-prefix preview path
+                --feed-seconds <seconds>  Preview cadence for either finalization benchmark (default: 0.6)
+                --final-tail-seconds <seconds>  Audio left for incremental finalization after the last preview
                 --metadata         Show confidence, start time, and end time in results
                 --word-timestamps  Show word-level timestamps for each word in the transcription
                 --output-json <file>  Save full transcription result to JSON (includes word timings)
@@ -877,6 +976,7 @@ enum TranscribeCommand {
                 fluidaudio transcribe audio.wav --word-timestamps  # Batch mode with word timestamps
                 fluidaudio transcribe audio.wav --streaming --metadata # Streaming mode with metadata
                 fluidaudio transcribe audio.wav --output-json results.json
+                fluidaudio transcribe audio.wav --incremental-final --feed-seconds 0.6
                 fluidaudio transcribe audio.wav --custom-vocab vocab.txt  # With vocabulary boosting
                 fluidaudio transcribe audio.wav --parakeet-variant parakeet-eou-320ms  # Any engine via protocol
 

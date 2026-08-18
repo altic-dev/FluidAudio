@@ -81,6 +81,16 @@ final class ContextBiasingConstantsTests: XCTestCase {
         XCTAssertGreaterThan(large.minSimilarity, small.minSimilarity)
     }
 
+    func testVeryLargeVocabScalesThresholds() {
+        let fifty = ContextBiasingConstants.rescorerConfig(forVocabSize: 50)
+        let hundred = ContextBiasingConstants.rescorerConfig(forVocabSize: 100)
+
+        XCTAssertEqual(fifty.minSimilarity, 0.80, accuracy: 0.01)
+        XCTAssertEqual(fifty.cbw, 2.0, accuracy: 0.01)
+        XCTAssertEqual(hundred.minSimilarity, 0.85, accuracy: 0.01)
+        XCTAssertEqual(hundred.cbw, 1.75, accuracy: 0.01)
+    }
+
     // MARK: - Effective minSimilarity (context override)
 
     func testEffectiveMinSimilarityRespectsCallerThreshold() {

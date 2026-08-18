@@ -69,7 +69,9 @@ internal struct TdtDecoderV2 {
         return ASRConfig(
             sampleRate: config.sampleRate,
             tdtConfig: adaptedTdt,
-            encoderHiddenSize: config.encoderHiddenSize
+            encoderHiddenSize: config.encoderHiddenSize,
+            streamingEnabled: config.streamingEnabled,
+            streamingThreshold: config.streamingThreshold
         )
     }
 }

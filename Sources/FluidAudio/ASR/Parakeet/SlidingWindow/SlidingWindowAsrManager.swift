@@ -539,11 +539,7 @@ public actor SlidingWindowAsrManager {
 
         do {
             // Run CTC inference on the chunk audio to get log probabilities
-            let spotResult = try await spotter.spotKeywordsWithLogProbs(
-                audioSamples: windowSamples,
-                customVocabulary: vocab,
-                minScore: nil
-            )
+            let spotResult = try await spotter.computeLogProbabilities(audioSamples: windowSamples)
 
             let logProbs = spotResult.logProbs
             guard !logProbs.isEmpty else {
