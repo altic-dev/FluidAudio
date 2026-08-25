@@ -10,6 +10,8 @@ private struct GraniteTurboCtcOptions {
     var computeUnits: MLComputeUnits = .cpuAndGPU
     /// Route through AsrModels/AsrManager — the exact path FluidVoice uses.
     var unified = false
+    /// Use the non-commercial checkpoint's cache (research/benchmarking only).
+    var nonCommercial = false
 }
 
 private struct GraniteTurboCtcReference: Decodable {
@@ -46,6 +48,8 @@ enum GraniteTurboCtcCommand {
                 options.referenceJSON = nextValue(arguments, at: &index, option: "--reference-json")
             case "--unified":
                 options.unified = true
+            case "--nc":
+                options.nonCommercial = true
             case "--compute-units":
                 guard let value = nextValue(arguments, at: &index, option: "--compute-units"),
                     let parsed = parseComputeUnits(value)
@@ -130,17 +134,18 @@ enum GraniteTurboCtcCommand {
         do {
             let configuration = MLModelConfiguration()
             configuration.computeUnits = options.computeUnits
+            let version: AsrModelVersion = options.nonCommercial ? .graniteTurboCtcNc : .graniteTurboCtc
             let models: AsrModels
             if let modelDir = options.modelDir {
                 models = try await AsrModels.load(
                     from: URL(fileURLWithPath: modelDir),
                     configuration: configuration,
-                    version: .graniteTurboCtc
+                    version: version
                 )
             } else {
                 models = try await AsrModels.downloadAndLoad(
                     configuration: configuration,
-                    version: .graniteTurboCtc
+                    version: version
                 )
             }
 

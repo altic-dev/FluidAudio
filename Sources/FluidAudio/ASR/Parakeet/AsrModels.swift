@@ -10,6 +10,8 @@ public enum AsrModelVersion: Sendable {
     case tdtCtc110m
     /// Granite Speech 5.0 470M TurboCTC: single-stage greedy CTC, no RNN-T decoder
     case graniteTurboCtc
+    /// Non-commercial Granite TurboCTC checkpoint (CC-BY-NC-SA); research/benchmarking only
+    case graniteTurboCtcNc
 
     var repo: Repo {
         switch self {
@@ -17,18 +19,19 @@ public enum AsrModelVersion: Sendable {
         case .v3: return .parakeet
         case .tdtCtc110m: return .parakeetTdtCtc110m
         case .graniteTurboCtc: return .graniteTurboCtc
+        case .graniteTurboCtcNc: return .graniteTurboCtcNc
         }
     }
 
     /// Single CoreML package with the CTC squash folded in; none of the RNN-T stages exist.
     public var isSingleStageCtc: Bool {
-        self == .graniteTurboCtc
+        self == .graniteTurboCtc || self == .graniteTurboCtcNc
     }
 
     /// Whether this model version uses a fused preprocessor+encoder (no separate Encoder model)
     public var hasFusedEncoder: Bool {
         switch self {
-        case .tdtCtc110m, .graniteTurboCtc: return true
+        case .tdtCtc110m, .graniteTurboCtc, .graniteTurboCtcNc: return true
         default: return false
         }
     }
@@ -46,7 +49,7 @@ public enum AsrModelVersion: Sendable {
         switch self {
         case .v2, .tdtCtc110m: return 1024
         case .v3: return 8192
-        case .graniteTurboCtc: return 0
+        case .graniteTurboCtc, .graniteTurboCtcNc: return 0
         }
     }
 

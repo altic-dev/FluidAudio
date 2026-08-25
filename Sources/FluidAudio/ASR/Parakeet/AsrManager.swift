@@ -378,7 +378,7 @@ public actor AsrManager {
         }
 
         switch models.version {
-        case .graniteTurboCtc:
+        case .graniteTurboCtc, .graniteTurboCtcNc:
             // TurboCTC never reaches the RNN-T decode path; transcribe() routes it earlier.
             throw ASRError.notInitialized
         case .v2, .tdtCtc110m:

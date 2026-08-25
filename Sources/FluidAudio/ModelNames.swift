@@ -21,8 +21,10 @@ public enum Repo: String, CaseIterable {
     case qwen3AsrInt8 = "FluidInference/qwen3-asr-0.6b-coreml/int8"
     case multilingualG2p = "FluidInference/charsiu-g2p-byt5-coreml"
     case parakeetTdtCtc110m = "FluidInference/parakeet-tdt-ctc-110m-coreml"
-    // Placeholder path until the converted bundle is uploaded; local cache is seeded manually for now.
+    // Placeholder paths until the converted bundles are uploaded; local cache is seeded manually for now.
     case graniteTurboCtc = "FluidInference/granite-speech-5.0-470m-turboctc-coreml"
+    // CC-BY-NC-SA weights: local research/benchmarking only, never host or ship this bundle.
+    case graniteTurboCtcNc = "FluidInference/granite-speech-5.0-470m-turboctc-nc-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
@@ -67,6 +69,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-tdt-ctc-110m-coreml"
         case .graniteTurboCtc:
             return "granite-speech-5.0-470m-turboctc-coreml"
+        case .graniteTurboCtcNc:
+            return "granite-speech-5.0-470m-turboctc-nc-coreml"
         }
     }
 
@@ -586,7 +590,7 @@ public enum ModelNames {
             return ModelNames.ASR.requiredModels
         case .parakeetTdtCtc110m:
             return ModelNames.ASR.requiredModelsFused
-        case .graniteTurboCtc:
+        case .graniteTurboCtc, .graniteTurboCtcNc:
             // Single manifest-described bundle; presence is checked via GraniteTurboCtcModels.
             return ["manifest.json"]
         case .parakeetCtc110m, .parakeetCtc06b:
