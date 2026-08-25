@@ -1,0 +1,15 @@
+[project]
+name = "granite-turboctc-coreml"
+version = "0.1.0"
+description = "CoreML export of IBM Granite Speech 5.0 470M TurboCTC"
+requires-python = ">=3.11"
+dependencies = [
+    "coremltools>=9.0",
+    "torch>=2.13",
+    "torchaudio",
+    "numpy<2",
+    "soundfile",
+    "huggingface_hub",
+    # transformers 5.16.0.dev0+ ships the granite_speech5 architecture natively.
+    "transformers @ git+https://github.com/huggingface/transformers.git",
+]
