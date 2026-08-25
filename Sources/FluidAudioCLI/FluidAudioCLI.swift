@@ -71,6 +71,8 @@ struct FluidAudioCLI {
             await Qwen3TranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
         case "granite-transcribe":
             await GraniteTranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
+        case "granite-turboctc":
+            await GraniteTurboCtcCommand.run(arguments: Array(arguments.dropFirst(2)))
         case "g2p-benchmark":
             await G2PBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "nemotron-benchmark":
@@ -118,6 +120,7 @@ struct FluidAudioCLI {
                 qwen3-benchmark         Run Qwen3 ASR benchmark
                 qwen3-transcribe        Transcribe using Qwen3 ASR
                 granite-transcribe      Transcribe using Granite NAR CoreML
+                granite-turboctc        Transcribe using Granite 5.0 TurboCTC CoreML
                 g2p-benchmark           Run multilingual G2P benchmark
                 nemotron-benchmark      Run Nemotron 0.6B streaming ASR benchmark
                 nemotron-commonvoice-benchmark
