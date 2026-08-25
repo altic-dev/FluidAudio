@@ -8,19 +8,27 @@ public enum AsrModelVersion: Sendable {
     case v3
     /// 110M parameter hybrid TDT-CTC model with fused preprocessor+encoder
     case tdtCtc110m
+    /// Granite Speech 5.0 470M TurboCTC: single-stage greedy CTC, no RNN-T decoder
+    case graniteTurboCtc
 
     var repo: Repo {
         switch self {
         case .v2: return .parakeetV2
         case .v3: return .parakeet
         case .tdtCtc110m: return .parakeetTdtCtc110m
+        case .graniteTurboCtc: return .graniteTurboCtc
         }
+    }
+
+    /// Single CoreML package with the CTC squash folded in; none of the RNN-T stages exist.
+    public var isSingleStageCtc: Bool {
+        self == .graniteTurboCtc
     }
 
     /// Whether this model version uses a fused preprocessor+encoder (no separate Encoder model)
     public var hasFusedEncoder: Bool {
         switch self {
-        case .tdtCtc110m: return true
+        case .tdtCtc110m, .graniteTurboCtc: return true
         default: return false
         }
     }
@@ -38,6 +46,7 @@ public enum AsrModelVersion: Sendable {
         switch self {
         case .v2, .tdtCtc110m: return 1024
         case .v3: return 8192
+        case .graniteTurboCtc: return 0
         }
     }
 
@@ -57,9 +66,12 @@ public struct AsrModels: Sendable {
 
     /// Separate encoder model (nil for fused models like tdtCtc110m where preprocessor includes encoder)
     public let encoder: MLModel?
-    public let preprocessor: MLModel
-    public let decoder: MLModel
-    public let joint: MLModel
+    /// RNN-T stages; nil only for single-stage CTC versions (graniteTurboCtc)
+    public let preprocessor: MLModel?
+    public let decoder: MLModel?
+    public let joint: MLModel?
+    /// Whole bundle for single-stage CTC versions; nil for RNN-T versions
+    public let turboCtc: GraniteTurboCtcModels?
     public let configuration: MLModelConfiguration
     public let vocabulary: [Int: String]
     public let version: AsrModelVersion
@@ -68,17 +80,19 @@ public struct AsrModels: Sendable {
 
     public init(
         encoder: MLModel?,
-        preprocessor: MLModel,
-        decoder: MLModel,
-        joint: MLModel,
+        preprocessor: MLModel?,
+        decoder: MLModel?,
+        joint: MLModel?,
         configuration: MLModelConfiguration,
         vocabulary: [Int: String],
-        version: AsrModelVersion
+        version: AsrModelVersion,
+        turboCtc: GraniteTurboCtcModels? = nil
     ) {
         self.encoder = encoder
         self.preprocessor = preprocessor
         self.decoder = decoder
         self.joint = joint
+        self.turboCtc = turboCtc
         self.configuration = configuration
         self.vocabulary = vocabulary
         self.version = version
@@ -160,6 +174,26 @@ extension AsrModels {
         logger.info("Loading ASR models from: \(directory.path)")
 
         let config = configuration ?? defaultConfiguration()
+
+        if version.isSingleStageCtc {
+            guard #available(macOS 14, iOS 17, *) else {
+                throw AsrModelsError.loadingFailed("Granite TurboCTC requires macOS 14 / iOS 17")
+            }
+            let bundle = try await GraniteTurboCtcModels.load(
+                from: repoPath(from: directory, version: version),
+                computeUnits: config.computeUnits
+            )
+            return AsrModels(
+                encoder: nil,
+                preprocessor: nil,
+                decoder: nil,
+                joint: nil,
+                configuration: config,
+                vocabulary: [:],
+                version: version,
+                turboCtc: bundle
+            )
+        }
 
         let parentDirectory = directory.deletingLastPathComponent()
         // Load preprocessor and encoder first; decoder and joint are loaded below as well.
@@ -370,6 +404,16 @@ extension AsrModels {
             return targetDir
         }
 
+        if version.isSingleStageCtc {
+            // Not hosted yet: the HF repo path is a placeholder. Seed the cache
+            // directory manually with the converted bundle for now.
+            throw AsrModelsError.downloadFailed(
+                "Granite TurboCTC bundle is not hosted yet. Place manifest.json, the "
+                    + ".mlpackage, mel_filters.bin and processor/ under: "
+                    + repoPath(from: targetDir, version: version).path
+            )
+        }
+
         if force {
             let fileManager = FileManager.default
             if fileManager.fileExists(atPath: targetDir.path) {
@@ -434,6 +478,10 @@ extension AsrModels {
     }
 
     public static func modelsExist(at directory: URL, version: AsrModelVersion) -> Bool {
+        if version.isSingleStageCtc {
+            guard #available(macOS 14, iOS 17, *) else { return false }
+            return GraniteTurboCtcModels.modelsExist(at: repoPath(from: directory, version: version))
+        }
         let fileManager = FileManager.default
         let requiredFiles =
             version.hasFusedEncoder ? ModelNames.ASR.requiredModelsFused : ModelNames.ASR.requiredModels

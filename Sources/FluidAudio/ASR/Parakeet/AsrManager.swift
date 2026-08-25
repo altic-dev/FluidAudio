@@ -18,6 +18,8 @@ public actor AsrManager {
     internal var encoderModel: MLModel?
     internal var decoderModel: MLModel?
     internal var jointModel: MLModel?
+    /// Single-stage CTC engine; non-nil only when initialized with a graniteTurboCtc bundle
+    private var turboCtcEngine: GraniteTurboCtcManager?
     internal var preparedParakeetPreprocessorOutputs: [UUID: ParakeetPreprocessorOutput] = [:]
     internal var preparedParakeetEncoderOutputs: [UUID: ParakeetEncoderOutput] = [:]
 
@@ -100,6 +102,7 @@ public actor AsrManager {
     }
 
     public var isAvailable: Bool {
+        if turboCtcEngine != nil { return true }
         let decoderReady = decoderModel != nil && jointModel != nil
         guard decoderReady else { return false }
 
@@ -118,6 +121,14 @@ public actor AsrManager {
         logger.info("Initializing AsrManager with provided models")
 
         self.asrModels = models
+
+        if let turboCtc = models.turboCtc {
+            let engine = GraniteTurboCtcManager()
+            try await engine.adopt(models: turboCtc)
+            self.turboCtcEngine = engine
+            logger.info("AsrManager initialized with Granite TurboCTC engine")
+            return
+        }
         self.preprocessorModel = models.preprocessor
         self.encoderModel = models.encoder
         self.decoderModel = models.decoder
@@ -367,6 +378,9 @@ public actor AsrManager {
         }
 
         switch models.version {
+        case .graniteTurboCtc:
+            // TurboCTC never reaches the RNN-T decode path; transcribe() routes it earlier.
+            throw ASRError.notInitialized
         case .v2, .tdtCtc110m:
             let decoder = TdtDecoderV2(config: adaptedConfig)
             return try await decoder.decodeWithTimings(
@@ -525,6 +539,9 @@ public actor AsrManager {
         _ audioSamples: [Float],
         source: AudioSource = .microphone
     ) async throws -> ASRResult {
+        if let turboCtcEngine {
+            return try await transcribeTurboCtc(audioSamples, engine: turboCtcEngine)
+        }
         let shouldEmitProgress = audioSamples.count > ASRConstants.maxModelSamples
         if shouldEmitProgress {
             _ = await progressEmitter.ensureSession()
@@ -546,6 +563,44 @@ public actor AsrManager {
             }
             throw error
         }
+    }
+
+    /// Run the single-stage Granite TurboCTC engine and map its output onto the
+    /// shared `ASRResult` shape used by every other version.
+    private func transcribeTurboCtc(
+        _ audioSamples: [Float],
+        engine: GraniteTurboCtcManager
+    ) async throws -> ASRResult {
+        let result = try await engine.transcribeDetailed(audioSamples: audioSamples)
+        guard let bundle = asrModels?.turboCtc else {
+            throw ASRError.notInitialized
+        }
+
+        // CTC emits on a fixed grid: one encoder frame per 80 ms of audio.
+        let frameSeconds = 1.0
+            / (Double(bundle.manifest.sampleRate)
+                / Double(bundle.manifest.hopLength * bundle.manifest.stackFactor * bundle.manifest.encoderSubsample))
+        let timings = result.tokens.map { token in
+            TokenTiming(
+                token: bundle.tokenizer.decode([token.id], lowercased: false),
+                tokenId: token.id,
+                startTime: Double(token.frameIndex) * frameSeconds,
+                endTime: Double(token.frameIndex + 1) * frameSeconds,
+                confidence: exp(token.logProbability)
+            )
+        }
+        let confidence =
+            timings.isEmpty
+            ? Float(0)
+            : timings.reduce(Float(0)) { $0 + $1.confidence } / Float(timings.count)
+
+        return ASRResult(
+            text: result.text,
+            confidence: confidence,
+            duration: result.durationSeconds,
+            processingTime: result.elapsedSeconds,
+            tokenTimings: timings
+        )
     }
 
     // Reset both decoder states
