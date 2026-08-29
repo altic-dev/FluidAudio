@@ -38,6 +38,9 @@ public struct StreamingAudioSourceFactory {
                 throw StreamingAudioError.processingFailed(
                     "Unsupported audio format \(inputFormat); failed to create converter")
             }
+            // Without explicit downmixing, AVAudioConverter maps only the first input channel
+            // into a mono target and silently drops speech carried by the other channels.
+            converter.downmix = inputFormat.channelCount > 1
 
             logger.debug(
                 "Streaming conversion \(inputFormat.sampleRate)Hz×\(inputFormat.channelCount)ch → \(targetFormat.sampleRate)Hz×\(targetFormat.channelCount)ch"
