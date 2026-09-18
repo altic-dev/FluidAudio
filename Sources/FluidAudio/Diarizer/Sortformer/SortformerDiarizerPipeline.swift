@@ -66,7 +66,7 @@ public final class SortformerDiarizer: Diarizer {
     private var _models: SortformerModels?
 
     // Native mel spectrogram (used when useNativePreprocessing is enabled)
-    private let melSpectrogram = AudioMelSpectrogram()
+    private let melSpectrogram: AudioMelSpectrogram
 
     // Audio buffering
     private var audioBuffer: [Float] = []
@@ -88,6 +88,7 @@ public final class SortformerDiarizer: Diarizer {
         var timelineConfig = timelineConfig
         timelineConfig.numSpeakers = config.numSpeakers
         self.config = config
+        self.melSpectrogram = config.melFrontend.makeSpectrogram()
         self.stateUpdater = SortformerStateUpdater(config: config)
         self._state = SortformerStreamingState(config: config)
         self._timeline = DiarizerTimeline(config: timelineConfig)
@@ -96,16 +97,23 @@ public final class SortformerDiarizer: Diarizer {
     /// Initialize with CoreML models (combined pipeline mode).
     ///
     /// - Parameters:
-    ///   - mainModelPath: Path to Sortformer.mlpackage
+    ///   - mainModelPath: Path to `Sortformer.mlpackage`, or to an already compiled `.mlmodelc`
+    ///   - configuration: Optional CoreML configuration; used verbatim when supplied
+    /// - Throws: `CancellationError` if the task is cancelled before the model is published; the
+    ///   diarizer is then left uninitialized rather than half-initialized.
     public func initialize(
-        mainModelPath: URL
+        mainModelPath: URL,
+        configuration: MLModelConfiguration? = nil
     ) async throws {
         logger.info("Initializing Sortformer diarizer (combined pipeline mode)")
 
         let loadedModels = try await SortformerModels.load(
             config: config,
-            mainModelPath: mainModelPath
+            mainModelPath: mainModelPath,
+            configuration: configuration
         )
+
+        try Task.checkCancellation()
 
         // Use withLock helper to avoid direct NSLock usage in async context
         withLock {
@@ -450,6 +458,14 @@ public final class SortformerDiarizer: Diarizer {
 
             // Trim embeddings to actual length
             let embLength = output.chunkLength
+            guard embLength >= 0,
+                embLength <= output.chunkEmbeddings.count / config.preEncoderDims
+            else {
+                throw SortformerError.inferenceFailed(
+                    "Model reported invalid chunk embedding length \(embLength) for "
+                        + "\(output.chunkEmbeddings.count / config.preEncoderDims) available frames"
+                )
+            }
             let chunkEmbs = Array(output.chunkEmbeddings.prefix(embLength * config.preEncoderDims))
 
             // Update state with correct context values
@@ -690,6 +706,14 @@ public final class SortformerDiarizer: Diarizer {
 
                 // Trim embeddings to actual length
                 let embLength = output.chunkLength
+                guard embLength >= 0,
+                    embLength <= output.chunkEmbeddings.count / config.preEncoderDims
+                else {
+                    throw SortformerError.inferenceFailed(
+                        "Model reported invalid chunk embedding length \(embLength) for "
+                            + "\(output.chunkEmbeddings.count / config.preEncoderDims) available frames"
+                    )
+                }
                 let chunkEmbs = Array(output.chunkEmbeddings.prefix(embLength * config.preEncoderDims))
 
                 // Compute left/right context for prediction extraction
@@ -767,9 +791,15 @@ public final class SortformerDiarizer: Diarizer {
 
         guard audioBuffer.count >= samplesNeeded else { return }
 
+        let expectedFrameCount =
+            config.melFrontend.family == .nemotron3Diarization
+            ? config.melFrontend.storageFrameCount(sampleCount: audioBuffer.count)
+            : nil
         let (mel, melLength, _) = melSpectrogram.computeFlatTransposed(
             audio: audioBuffer,
-            lastAudioSample: lastAudioSample
+            lastAudioSample: lastAudioSample,
+            paddingMode: .center,
+            expectedFrameCount: expectedFrameCount
         )
 
         guard melLength > 0 else { return }
@@ -884,7 +914,9 @@ public final class SortformerDiarizer: Diarizer {
         guard audioBuffer.count >= config.melWindow else {
             return 0
         }
-        // Use center-padded frame count formula matching AudioMelSpectrogram.computeFlatTransposed
+        if config.melFrontend.family == .nemotron3Diarization {
+            return config.melFrontend.storageFrameCount(sampleCount: audioBuffer.count)
+        }
         let paddedCount = audioBuffer.count + melSpectrogram.nFFT
         return 1 + (paddedCount - config.melWindow) / config.melStride
     }

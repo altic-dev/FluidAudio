@@ -33,7 +33,8 @@ final class SortformerTests: XCTestCase {
             streamingChunks.append(mel)
         }
 
-        // 3. Compare
+        // 3. Legacy Sortformer must keep exact batch/streaming feature parity. Nemotron's partial
+        // tail behavior is covered separately by its compatibility tests.
         XCTAssertEqual(batchChunks.count, streamingChunks.count, "Chunk count mismatch")
 
         for i in 0..<batchChunks.count {

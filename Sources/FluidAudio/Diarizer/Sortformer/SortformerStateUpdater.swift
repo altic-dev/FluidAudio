@@ -43,6 +43,30 @@ public struct SortformerStateUpdater {
         let currentSpkcacheLength = state.spkcacheLength
         let currentFifoLength = state.fifoLength
 
+        func exactCount(_ length: Int, width: Int) -> Int? {
+            guard length >= 0 else { return nil }
+            let (count, overflow) = length.multipliedReportingOverflow(by: width)
+            return overflow ? nil : count
+        }
+
+        guard chunk.count.isMultiple(of: fcDModel) else {
+            throw SortformerError.insufficientChunkLength(
+                "Chunk embedding buffer has \(chunk.count) scalars, not a multiple of width \(fcDModel)"
+            )
+        }
+        guard let expectedSpkcacheCount = exactCount(currentSpkcacheLength, width: fcDModel),
+            let expectedFifoCount = exactCount(currentFifoLength, width: fcDModel),
+            let expectedSpkcachePredCount = exactCount(currentSpkcacheLength, width: numSpeakers),
+            let expectedFifoPredCount = exactCount(currentFifoLength, width: numSpeakers),
+            state.spkcache.count == expectedSpkcacheCount,
+            state.fifo.count == expectedFifoCount,
+            state.spkcachePreds == nil || state.spkcachePreds?.count == expectedSpkcachePredCount,
+            state.fifoPreds == nil || state.fifoPreds?.count == expectedFifoPredCount
+        else {
+            throw SortformerError.invalidState(
+                "Streaming state lengths do not match their embedding/prediction buffers")
+        }
+
         // Extract FIFO predictions if FIFO exists
         if currentFifoLength > 0 {
             let fifoPredsStart = currentSpkcacheLength * numSpeakers
@@ -60,6 +84,13 @@ public struct SortformerStateUpdater {
         let lc = leftContext
         let rc = rightContext
         let coreFrames = (chunk.count / fcDModel) - lc - rc
+
+        guard lc >= 0, rc >= 0, coreFrames > 0, coreFrames <= config.chunkLen else {
+            throw SortformerError.insufficientChunkLength(
+                "Invalid encoded chunk geometry: total=\(chunk.count / fcDModel), left=\(lc), "
+                    + "core=\(coreFrames), right=\(rc), maximumCore=\(config.chunkLen)"
+            )
+        }
 
         // Extract core embeddings only (frames lc..<lc+coreFrames)
         let embsStartIdx = lc * fcDModel

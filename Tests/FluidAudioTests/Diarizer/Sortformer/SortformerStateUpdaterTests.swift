@@ -76,7 +76,7 @@ final class SortformerStateUpdaterTests: XCTestCase {
         var state = SortformerStreamingState(config: config)
 
         // Provide enough chunk data but insufficient predictions
-        let chunkFrames = config.coreFrames + config.chunkLeftContext + config.chunkRightContext
+        let chunkFrames = config.chunkEncoderFrames
         let chunk = [Float](repeating: 0, count: chunkFrames * config.preEncoderDims)
         let preds = [Float](repeating: 0, count: 1)  // Way too short
 
@@ -107,7 +107,7 @@ final class SortformerStateUpdaterTests: XCTestCase {
         var state = SortformerStreamingState(config: config)
 
         // Build valid-sized inputs
-        let totalChunkFrames = config.coreFrames + config.chunkLeftContext + config.chunkRightContext
+        let totalChunkFrames = config.chunkEncoderFrames
         let chunk = [Float](repeating: 0, count: totalChunkFrames * config.preEncoderDims)
         let predsFrames = totalChunkFrames  // spkcache=0, fifo=0, so preds matches chunk frames
         let preds = [Float](repeating: 0, count: predsFrames * config.numSpeakers)
@@ -121,8 +121,55 @@ final class SortformerStateUpdaterTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            result.confirmed.count, config.coreFrames * config.numSpeakers,
-            "Confirmed should have coreFrames * numSpeakers elements"
+            result.confirmed.count, config.chunkLen * config.numSpeakers,
+            "Confirmed should have chunkLen * numSpeakers elements"
         )
+    }
+
+    func testStreamingUpdateRejectsEmbeddingScalarRemainder() {
+        let config = SortformerConfig.default
+        let updater = SortformerStateUpdater(config: config)
+        var state = SortformerStreamingState(config: config)
+
+        XCTAssertThrowsError(
+            try updater.streamingUpdate(
+                state: &state,
+                chunk: [Float](repeating: 0, count: config.chunkEncoderFrames * config.preEncoderDims - 1),
+                preds: [Float](repeating: 0, count: config.predictionFrames * config.numSpeakers),
+                leftContext: config.chunkLeftContext,
+                rightContext: config.chunkRightContext
+            ))
+    }
+
+    func testStreamingUpdateRejectsStateLengthBufferMismatch() {
+        let config = SortformerConfig.default
+        let updater = SortformerStateUpdater(config: config)
+        var state = SortformerStreamingState(config: config)
+        state.fifoLength = 1
+
+        XCTAssertThrowsError(
+            try updater.streamingUpdate(
+                state: &state,
+                chunk: [Float](repeating: 0, count: config.chunkEncoderFrames * config.preEncoderDims),
+                preds: [Float](repeating: 0, count: config.predictionFrames * config.numSpeakers),
+                leftContext: config.chunkLeftContext,
+                rightContext: config.chunkRightContext
+            ))
+    }
+
+    func testStreamingUpdateRejectsOverflowingStateLengthWithoutTrapping() {
+        let config = SortformerConfig.default
+        let updater = SortformerStateUpdater(config: config)
+        var state = SortformerStreamingState(config: config)
+        state.fifoLength = Int.max
+
+        XCTAssertThrowsError(
+            try updater.streamingUpdate(
+                state: &state,
+                chunk: [Float](repeating: 0, count: config.chunkEncoderFrames * config.preEncoderDims),
+                preds: [Float](repeating: 0, count: config.predictionFrames * config.numSpeakers),
+                leftContext: config.chunkLeftContext,
+                rightContext: config.chunkRightContext
+            ))
     }
 }

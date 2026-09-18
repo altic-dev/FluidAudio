@@ -17,6 +17,9 @@ public struct SortformerModels {
     /// Time taken to compile/load models
     public let compilationDuration: TimeInterval
 
+    /// Tensor geometry and feature names read from `mainModel`'s own description.
+    public let geometry: SortformerModelGeometry
+
     /// Cached buffers
     private let memoryOptimizer: ANEMemoryOptimizer
     private let chunkArray: MLMultiArray
@@ -26,6 +29,8 @@ public struct SortformerModels {
     private let spkcacheArray: MLMultiArray
     private let spkcacheLengthArray: MLMultiArray
 
+    /// - Throws: `SortformerError.modelLoadFailed` if the model's inputs/outputs are unrecognized, or
+    ///   `SortformerError.configurationError` if `config` does not match the model's declared shapes.
     public init(
         config: SortformerConfig,
         main: MLModel,
@@ -33,6 +38,11 @@ public struct SortformerModels {
     ) throws {
         self.mainModel = main
         self.compilationDuration = compilationDuration
+
+        try config.validateGeometry()
+        let geometry = try SortformerModelGeometry.inspect(model: main)
+        try geometry.validate(against: config)
+        self.geometry = geometry
 
         self.memoryOptimizer = .init()
         self.chunkArray = try memoryOptimizer.createAlignedArray(
@@ -56,10 +66,12 @@ extension SortformerModels {
     /// Load models from local file paths (combined pipeline mode).
     ///
     /// - Parameters:
-    ///   - preprocessorPath: Path to SortformerPreprocessor.mlpackage
-    ///   - mainModelPath: Path to Sortformer.mlpackage
-    ///   - configuration: Optional MLModel configuration
+    ///   - config: Sortformer configuration; validated against the model's declared shapes
+    ///   - mainModelPath: Path to `Sortformer.mlpackage` (compiled on load) or to an already
+    ///     compiled `Sortformer.mlmodelc` directory (loaded as-is)
+    ///   - configuration: Optional MLModel configuration; used verbatim when supplied
     /// - Returns: Loaded SortformerModels
+    /// - Throws: `CancellationError` if the enclosing task is cancelled before the model is returned.
     public static func load(
         config: SortformerConfig,
         mainModelPath: URL,
@@ -69,15 +81,35 @@ extension SortformerModels {
 
         let startTime = Date()
 
-        // Compile mlpackage to mlmodelc first
-        logger.info("Compiling main model...")
-        let compiledMainModelURL = try await MLModel.compileModel(at: mainModelPath)
+        try Task.checkCancellation()
 
-        // Load main model - .all lets CoreML pick optimal compute units
-        let mainConfig = MLModelConfiguration()
-        mainConfig.computeUnits = .all
-        let mainModel = try MLModel(contentsOf: compiledMainModelURL, configuration: mainConfig)
+        // An `.mlmodelc` directory is already compiled; anything else (`.mlpackage`, `.mlmodel`)
+        // goes through the compiler.
+        let compiledMainModelURL: URL
+        if mainModelPath.pathExtension.lowercased() == "mlmodelc" {
+            logger.info("Using pre-compiled main model")
+            compiledMainModelURL = mainModelPath
+        } else {
+            logger.info("Compiling main model...")
+            compiledMainModelURL = try await MLModel.compileModel(at: mainModelPath)
+        }
+
+        try Task.checkCancellation()
+
+        // Honor a caller-supplied configuration; otherwise keep the historical default where
+        // .all lets CoreML pick optimal compute units.
+        let mainConfig: MLModelConfiguration
+        if let configuration {
+            mainConfig = configuration
+        } else {
+            mainConfig = MLModelConfiguration()
+            mainConfig.computeUnits = .all
+        }
+        let mainModel = try await MLModel.load(contentsOf: compiledMainModelURL, configuration: mainConfig)
         logger.info("Loaded main Sortformer model")
+
+        // Loading can take tens of seconds; don't hand a model back to a caller that gave up.
+        try Task.checkCancellation()
 
         let duration = Date().timeIntervalSince(startTime)
         logger.info("Models loaded in \(String(format: "%.2f", duration))s")
@@ -195,6 +227,37 @@ extension SortformerModels {
         fifoLength: Int,
         config: SortformerConfig
     ) throws -> MainModelOutput {
+        func exactCount(_ length: Int, width: Int) -> Int? {
+            guard length >= 0 else { return nil }
+            let (count, overflow) = length.multipliedReportingOverflow(by: width)
+            return overflow ? nil : count
+        }
+
+        guard chunkLength >= 0,
+            chunkLength <= config.chunkMelFrames,
+            chunk.count <= chunkArray.count,
+            chunk.count.isMultiple(of: config.melFeatures),
+            chunkLength <= chunk.count / config.melFeatures
+        else {
+            throw SortformerError.invalidState(
+                "Chunk features or reported length exceed the configured model input"
+            )
+        }
+        guard let expectedFifoCount = exactCount(fifoLength, width: config.preEncoderDims),
+            fifoLength <= config.fifoLen,
+            fifo.count == expectedFifoCount,
+            fifo.count <= fifoArray.count
+        else {
+            throw SortformerError.invalidState("FIFO buffer does not match its reported length")
+        }
+        guard let expectedSpkcacheCount = exactCount(spkcacheLength, width: config.preEncoderDims),
+            spkcacheLength <= config.spkcacheLen,
+            spkcache.count == expectedSpkcacheCount,
+            spkcache.count <= spkcacheArray.count
+        else {
+            throw SortformerError.invalidState("Speaker-cache buffer does not match its reported length")
+        }
+
         // Copy chunk features
         memoryOptimizer.optimizedCopy(
             from: chunk,
@@ -225,71 +288,37 @@ extension SortformerModels {
         // Create speaker cache length input
         spkcacheLengthArray[0] = NSNumber(value: Int32(spkcacheLength))
 
-        // Run inference
+        // Run inference using the feature names resolved from the model's own description, so both
+        // the shipped Sortformer exports and Nemotron-style exports work unchanged.
+        let names = geometry.names
         let inputFeatures = try MLDictionaryFeatureProvider(dictionary: [
-            "chunk": MLFeatureValue(multiArray: chunkArray),
-            "chunk_lengths": MLFeatureValue(multiArray: chunkLengthArray),
-            "spkcache": MLFeatureValue(multiArray: spkcacheArray),
-            "spkcache_lengths": MLFeatureValue(multiArray: spkcacheLengthArray),
-            "fifo": MLFeatureValue(multiArray: fifoArray),
-            "fifo_lengths": MLFeatureValue(multiArray: fifoLengthArray),
+            names.chunk: MLFeatureValue(multiArray: chunkArray),
+            names.chunkLengths: MLFeatureValue(multiArray: chunkLengthArray),
+            names.spkcache: MLFeatureValue(multiArray: spkcacheArray),
+            names.spkcacheLengths: MLFeatureValue(multiArray: spkcacheLengthArray),
+            names.fifo: MLFeatureValue(multiArray: fifoArray),
+            names.fifoLengths: MLFeatureValue(multiArray: fifoLengthArray),
         ])
 
         let output = try mainModel.prediction(from: inputFeatures)
 
-        // Extract outputs (names must match CoreML Sortformer model)
-        // Note: Output names use _out suffix to avoid macOS 26+ BNNS compiler error
-        // where input and output tensors cannot share the same name
-
-        // Chunk embeddings may be Float16 (head module uses fp16) or Float32
-        let chunkEmbeddings: [Float]
-        let predictions: [Float]
-        let chunkEmbeddingsLength: Int
-
-        // Get speaker probabilities
-        if let preds = output.featureValue(for: "speaker_preds_out")?.shapedArrayValue(of: Float32.self)?.scalars {
-            predictions = preds
-        } else if let preds = output.featureValue(for: "speaker_preds")?.shapedArrayValue(of: Float32.self)?.scalars {
-            predictions = preds
-        } else {
-            throw SortformerError.inferenceFailed("Missing speaker_preds or speaker_preds_out")
+        // Predictions and embeddings may be Float16 (Nemotron, and fp16 head modules) or Float32.
+        guard let predictions = SortformerModelGeometry.floatScalars(from: output, named: names.predictions)
+        else {
+            throw SortformerError.inferenceFailed("Missing or unreadable output '\(names.predictions)'")
         }
 
-        // Get chunk length
-        if let length = output.featureValue(for: "chunk_pre_encoder_lengths_out")?.shapedArrayValue(
-            of: Int32.self)?.scalars.first
-        {
-            chunkEmbeddingsLength = Int(length)
-        } else if let length = output.featureValue(for: "chunk_pre_encoder_lengths")?.shapedArrayValue(
-            of: Int32.self)?.scalars.first
-        {
-            chunkEmbeddingsLength = Int(length)
-        } else {
-            throw SortformerError.inferenceFailed("Missing chunk_pre_encoder_lengths or chunk_pre_encoder_lengths_out")
+        guard
+            let chunkEmbeddingsLength = SortformerModelGeometry.firstInt(
+                from: output, named: names.chunkEmbeddingLengths)
+        else {
+            throw SortformerError.inferenceFailed("Missing or unreadable output '\(names.chunkEmbeddingLengths)'")
         }
 
-        // Get acoustic embeddings
-        if let fp32 = output.featureValue(for: "chunk_pre_encoder_embs_out")?.shapedArrayValue(of: Float32.self)?
-            .scalars
-        {
-            chunkEmbeddings = fp32
-        } else if let fp32 = output.featureValue(for: "chunk_pre_encoder_embs")?.shapedArrayValue(of: Float32.self)?
-            .scalars
-        {
-            chunkEmbeddings = fp32
-        } else {
-            #if arch(arm64)
-            if #available(macOS 15.0, iOS 18.0, *),
-                let fp16 = output.featureValue(for: "chunk_pre_encoder_embs_out")?.shapedArrayValue(of: Float16.self)?
-                    .scalars
-            {
-                chunkEmbeddings = fp16.map { Float($0) }
-            } else {
-                throw SortformerError.inferenceFailed("Missing chunk_pre_encoder_embs_out")
-            }
-            #else
-            throw SortformerError.inferenceFailed("Missing chunk_pre_encoder_embs_out")
-            #endif
+        guard
+            let chunkEmbeddings = SortformerModelGeometry.floatScalars(from: output, named: names.chunkEmbeddings)
+        else {
+            throw SortformerError.inferenceFailed("Missing or unreadable output '\(names.chunkEmbeddings)'")
         }
 
         return MainModelOutput(
