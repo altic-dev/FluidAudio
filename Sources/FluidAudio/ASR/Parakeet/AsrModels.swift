@@ -220,9 +220,53 @@ extension AsrModels {
         return asrModels
     }
 
-    private static func loadVocabulary(from directory: URL, version: AsrModelVersion) throws -> [Int: String] {
-        let vocabPath = repoPath(from: directory, version: version).appendingPathComponent(
-            Names.vocabulary(for: version.repo))
+    /// Load installed compiled models without downloading, deleting, or repairing model files.
+    /// Optional background work should use this entry point and defer recovery to explicit model setup.
+    public static func loadLocalOnly(
+        from directory: URL, version: AsrModelVersion = .v3
+    ) async throws -> AsrModels {
+        try Task.checkCancellation()
+        guard directory.isFileURL else {
+            throw AsrModelsError.loadingFailed("Local model loading requires a file URL")
+        }
+        let configuration = defaultConfiguration()
+        let specs = createModelSpecs(using: configuration, version: version)
+        let names = specs.map(\.fileName) + [Names.decoderFile, Names.jointFile, Names.vocabulary(for: version.repo)]
+        for name in names {
+            let path = directory.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: path.path) else {
+                throw AsrModelsError.modelNotFound(name, path)
+            }
+        }
+        let vocabulary = try loadVocabulary(from: directory, version: version, resolvingRepositoryDirectory: false)
+        var loaded: [String: MLModel] = [:]
+        for spec in specs {
+            try Task.checkCancellation()
+            let config = defaultConfiguration()
+            config.computeUnits = spec.computeUnits
+            loaded[spec.fileName] = try await MLModel.load(
+                contentsOf: directory.appendingPathComponent(spec.fileName), configuration: config)
+        }
+        try Task.checkCancellation()
+        let decoder = try await MLModel.load(
+            contentsOf: directory.appendingPathComponent(Names.decoderFile), configuration: configuration)
+        try Task.checkCancellation()
+        let joint = try await MLModel.load(
+            contentsOf: directory.appendingPathComponent(Names.jointFile), configuration: configuration)
+        try Task.checkCancellation()
+        guard let preprocessor = loaded[Names.preprocessorFile] else {
+            throw AsrModelsError.loadingFailed("Local preprocessor model unavailable")
+        }
+        return AsrModels(
+            encoder: loaded[Names.encoderFile], preprocessor: preprocessor, decoder: decoder, joint: joint,
+            configuration: configuration, vocabulary: vocabulary, version: version)
+    }
+
+    private static func loadVocabulary(
+        from directory: URL, version: AsrModelVersion, resolvingRepositoryDirectory: Bool = true
+    ) throws -> [Int: String] {
+        let vocabularyDirectory = resolvingRepositoryDirectory ? repoPath(from: directory, version: version) : directory
+        let vocabPath = vocabularyDirectory.appendingPathComponent(Names.vocabulary(for: version.repo))
 
         if !FileManager.default.fileExists(atPath: vocabPath.path) {
             logger.warning(

@@ -4,6 +4,28 @@ import XCTest
 @testable import FluidAudio
 
 final class PronunciationAudioEnrollmentTests: XCTestCase {
+    func testLocalModelLoadingFailurePreservesExistingFiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let marker = directory.appendingPathComponent("existing-installation.txt")
+        try Data("keep".utf8).write(to: marker)
+        do {
+            _ = try await AsrModels.loadLocalOnly(from: directory, version: .v3)
+            XCTFail("Missing models must fail without cache recovery")
+        } catch AsrModelsError.modelNotFound {}
+        XCTAssertEqual(try Data(contentsOf: marker), Data("keep".utf8))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path), ["existing-installation.txt"])
+    }
+
+    func testLocalModelLoadingRejectsRemoteURL() async throws {
+        do {
+            _ = try await AsrModels.loadLocalOnly(from: URL(string: "https://example.invalid/models")!)
+            XCTFail("Remote URLs are not local installations")
+        } catch AsrModelsError.loadingFailed {}
+    }
+
     func testRejectsInvalidEvidenceBeforeLoadingModels() async throws {
         let manager = AsrManager()
         do {
@@ -28,7 +50,7 @@ final class PronunciationAudioEnrollmentTests: XCTestCase {
             let modelPath = environment["FLUIDAUDIO_PARAKEET_MODEL_DIR"]
         else { throw XCTSkip("Set real pronunciation audio and Parakeet model paths") }
         let samples = Array(try AudioConverter().resampleAudioFile(path: audioPath).prefix(160_000))
-        let models = try await AsrModels.load(from: URL(fileURLWithPath: modelPath), version: .v3)
+        let models = try await AsrModels.loadLocalOnly(from: URL(fileURLWithPath: modelPath), version: .v3)
         let manager = AsrManager(
             config: ASRConfig(tdtConfig: TdtConfig(blankId: AsrModelVersion.v3.blankId), encoderHiddenSize: 1024))
         try await manager.initialize(models: models)
