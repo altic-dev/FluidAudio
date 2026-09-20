@@ -254,6 +254,43 @@ extension AsrManager {
         }
     }
 
+    /// Reads the output owned by this handle before decoding releases its backing buffers.
+    /// No global capture flag or latest-feature slot is involved.
+    func pronunciationMatches(
+        preparedEncoder handle: PreparedParakeetEncoderHandle,
+        work: ParakeetChunkWork,
+        prototypes: [PronunciationEmbedding]
+    ) throws -> [PronunciationWindowMatch] {
+        guard !prototypes.isEmpty else { return [] }
+        guard let output = preparedParakeetEncoderOutputs[handle.id] else {
+            throw ASRError.processingFailed("Prepared pronunciation output is unavailable")
+        }
+        let encoder = try extractFeatureValue(
+            from: output.encoderOutput, key: "encoder", errorMessage: "Invalid encoder output"
+        )
+        let length = try extractFeatureValue(
+            from: output.encoderOutput, key: "encoder_length", errorMessage: "Invalid encoder length"
+        )
+        let offset = work.chunkStart / ASRConstants.samplesPerEncoderFrame
+        guard
+            let features = try makePronunciationEncoderFeatures(
+                encoder, encoderSequenceLength: length[0].intValue,
+                actualAudioFrames: ASRConstants.calculateEncoderFrames(from: work.samples.count - work.contextSamples),
+                contextFrameAdjustment: work.contextSamples / ASRConstants.samplesPerEncoderFrame,
+                globalFrameOffset: offset
+            )
+        else { return [] }
+        return PronunciationEmbeddingMatcher.allMatches(prototypes: prototypes, in: features)
+            .enumerated().flatMap { index, matches in
+                matches.map { match in
+                    PronunciationWindowMatch(
+                        prototypeIndex: index, score: match.score,
+                        frameRange: (offset + match.frameRange.lowerBound)..<(offset + match.frameRange.upperBound)
+                    )
+                }
+            }
+    }
+
     func executeMLInferenceWithTimings(
         preparedEncoder handle: PreparedParakeetEncoderHandle,
         paddedAudio: [Float],

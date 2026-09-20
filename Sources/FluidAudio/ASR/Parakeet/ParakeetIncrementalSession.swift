@@ -95,11 +95,24 @@ public actor ParakeetIncrementalSession {
     private var lastPreviewSampleCount = -1
     private var lastPreviewResult: ASRResult?
     private var lifecycle = Lifecycle.active
+    private var operationInFlight = false
+    private let pronunciationPrototypes: [PronunciationEmbedding]
+    private var pronunciationWindows = PronunciationWindowMatches()
 
-    init(manager: AsrManager, source: AudioSource, appliesVocabularyBoosting: Bool) {
+    /// Latest decoded text before optional vocabulary rescoring changes its spelling.
+    public var unboostedText: String? { lastPreviewResult?.text }
+
+    /// Includes stable hits plus the current tail, in recording-global encoder frames.
+    public var pronunciationMatches: [PronunciationWindowMatch] { pronunciationWindows.all }
+
+    init(
+        manager: AsrManager, source: AudioSource, appliesVocabularyBoosting: Bool,
+        pronunciationPrototypes: [PronunciationEmbedding] = []
+    ) {
         self.manager = manager
         self.source = source
         self.appliesVocabularyBoosting = appliesVocabularyBoosting
+        self.pronunciationPrototypes = pronunciationPrototypes
     }
 
     /// Number of source samples accepted by this session.
@@ -117,6 +130,9 @@ public actor ParakeetIncrementalSession {
     /// Appends only the samples captured since the preceding call.
     public func append(_ newSamples: [Float]) async throws {
         try requireActive()
+        guard !operationInFlight else { throw ASRError.processingFailed("Incremental operation already in progress") }
+        operationInFlight = true
+        defer { operationInFlight = false }
         guard !newSamples.isEmpty else { return }
         do {
             try Task.checkCancellation()
@@ -127,6 +143,7 @@ public actor ParakeetIncrementalSession {
                     offsetBy: min(layout.maxModelSamples, newSamples.distance(from: offset, to: newSamples.endIndex))
                 )
                 state.append(newSamples[offset..<end])
+                pronunciationWindows.replaceTail([])
                 lastPreviewResult = nil
                 lastPreviewSampleCount = -1
                 try await processStableWindows()
@@ -135,6 +152,7 @@ public actor ParakeetIncrementalSession {
             }
         } catch {
             lifecycle = .failed
+            pronunciationWindows = PronunciationWindowMatches()
             throw error
         }
     }
@@ -142,6 +160,9 @@ public actor ParakeetIncrementalSession {
     /// Produces a transcript for all accepted samples while retaining reusable stable windows.
     public func preview() async throws -> ASRResult {
         try requireActive()
+        guard !operationInFlight else { throw ASRError.processingFailed("Incremental operation already in progress") }
+        operationInFlight = true
+        defer { operationInFlight = false }
         guard state.totalSampleCount >= layout.sampleRate else {
             throw ASRError.invalidAudioData
         }
@@ -149,6 +170,7 @@ public actor ParakeetIncrementalSession {
             return try await makePreview()
         } catch {
             lifecycle = .failed
+            pronunciationWindows = PronunciationWindowMatches()
             throw error
         }
     }
@@ -156,6 +178,9 @@ public actor ParakeetIncrementalSession {
     /// Finalizes the session. If the last preview covered the same sample count, no model work is repeated.
     public func finish(finalAudioSamples: [Float]? = nil) async throws -> ASRResult {
         try requireActive()
+        guard !operationInFlight else { throw ASRError.processingFailed("Incremental operation already in progress") }
+        operationInFlight = true
+        defer { operationInFlight = false }
         guard state.totalSampleCount >= layout.sampleRate else {
             throw ASRError.invalidAudioData
         }
@@ -175,10 +200,12 @@ public actor ParakeetIncrementalSession {
                     audioSamples: finalAudioSamples
                 )
             }
+            try Task.checkCancellation()
             lifecycle = .finished
             return result
         } catch {
             lifecycle = .failed
+            pronunciationWindows = PronunciationWindowMatches()
             throw error
         }
     }
@@ -195,13 +222,14 @@ public actor ParakeetIncrementalSession {
     }
 
     private func makePreview() async throws -> ASRResult {
+        try Task.checkCancellation()
         if lastPreviewSampleCount == state.totalSampleCount, let lastPreviewResult {
             return lastPreviewResult
         }
 
         let startedAt = Date()
         let result: ASRResult
-        if state.totalSampleCount <= layout.maxModelSamples {
+        if state.totalSampleCount <= layout.maxModelSamples && pronunciationPrototypes.isEmpty {
             result = try await manager.transcribeWithState(
                 state.retainedSamples,
                 source: source,
@@ -217,6 +245,7 @@ public actor ParakeetIncrementalSession {
             )
         }
 
+        try Task.checkCancellation()
         lastPreviewSampleCount = state.totalSampleCount
         lastPreviewResult = result
         return result
@@ -235,28 +264,44 @@ public actor ParakeetIncrementalSession {
                 decoderLayers: await manager.getDecoderLayers()
             )
             decoderState.reset()
-            let window = try await ParakeetChunkInference.transcribe(
+            let output = try await ParakeetChunkInference.transcribeWithPronunciation(
                 work: work,
                 using: manager,
-                decoderState: &decoderState
+                decoderState: &decoderState, prototypes: pronunciationPrototypes
             )
-            state.recordFinalizedWindow(window)
+            try Task.checkCancellation()
+            pronunciationWindows.finalize(output.matches)
+            state.recordFinalizedWindow(output.window)
         }
     }
 
     private func transcribeTailWindow() async throws -> [TokenWindow] {
-        guard let work = try state.makeTailWork() else {
-            return []
+        let work: ParakeetChunkWork
+        if state.totalSampleCount <= layout.maxModelSamples {
+            // Mirror short-utterance frame alignment and decoder end handling.
+            let count = state.totalSampleCount
+            let aligned = min(
+                layout.maxModelSamples,
+                ((count + ASRConstants.samplesPerEncoderFrame - 1) / ASRConstants.samplesPerEncoderFrame)
+                    * ASRConstants.samplesPerEncoderFrame)
+            let samples = state.retainedSamples + Array(repeating: Float(0), count: aligned - count)
+            work = ParakeetChunkWork(
+                samples: samples,
+                paddedSamples: samples + Array(repeating: 0, count: layout.maxModelSamples - aligned),
+                contextSamples: 0, chunkStart: 0, chunkEnd: count, isLastChunk: false
+            )
+        } else {
+            guard let tail = try state.makeTailWork() else { return [] }
+            work = tail
         }
-        var decoderState = TdtDecoderState.make(
-            decoderLayers: await manager.getDecoderLayers()
-        )
+        var decoderState = TdtDecoderState.make(decoderLayers: await manager.getDecoderLayers())
         decoderState.reset()
-        return try await ParakeetChunkInference.transcribe(
-            work: work,
-            using: manager,
-            decoderState: &decoderState
+        let output = try await ParakeetChunkInference.transcribeWithPronunciation(
+            work: work, using: manager, decoderState: &decoderState, prototypes: pronunciationPrototypes
         )
+        try Task.checkCancellation()
+        pronunciationWindows.replaceTail(output.matches)
+        return output.window
     }
 
     private func makeResult(
@@ -288,13 +333,15 @@ extension AsrManager {
     /// Creates an incremental session that is text-equivalent to batch Parakeet chunking.
     /// Pass the complete waveform to `finish(finalAudioSamples:)` when vocabulary boosting is configured.
     public func makeIncrementalSession(
-        source: AudioSource = .microphone
+        source: AudioSource = .microphone,
+        pronunciationPrototypes: [PronunciationEmbedding] = []
     ) throws -> ParakeetIncrementalSession {
         guard isAvailable else { throw ASRError.notInitialized }
         return ParakeetIncrementalSession(
             manager: self,
             source: source,
-            appliesVocabularyBoosting: vocabBoostingEnabled
+            appliesVocabularyBoosting: vocabBoostingEnabled,
+            pronunciationPrototypes: pronunciationPrototypes
         )
     }
 }

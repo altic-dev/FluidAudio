@@ -58,6 +58,20 @@ extension AsrManager {
         globalFrameOffset: Int
     ) throws {
         guard pronunciationCustomizationEnabled else { return }
+        lastPronunciationEncoderFeatures = try makePronunciationEncoderFeatures(
+            encoderOutput, encoderSequenceLength: encoderSequenceLength,
+            actualAudioFrames: actualAudioFrames, contextFrameAdjustment: contextFrameAdjustment,
+            globalFrameOffset: globalFrameOffset
+        )
+    }
+
+    internal func makePronunciationEncoderFeatures(
+        _ encoderOutput: MLMultiArray,
+        encoderSequenceLength: Int,
+        actualAudioFrames: Int,
+        contextFrameAdjustment: Int,
+        globalFrameOffset: Int
+    ) throws -> EncoderFeatureSequence? {
         let captureStartedAt = ContinuousClock.now
 
         let view = try EncoderFrameView(
@@ -68,8 +82,7 @@ extension AsrManager {
         let firstFrame = min(max(0, contextFrameAdjustment), view.count)
         let frameCount = min(max(0, actualAudioFrames), view.count - firstFrame)
         guard frameCount > 0 else {
-            lastPronunciationEncoderFeatures = nil
-            return
+            return nil
         }
 
         var values = [Float](repeating: 0, count: frameCount * view.hiddenSize)
@@ -84,7 +97,7 @@ extension AsrManager {
             }
         }
 
-        lastPronunciationEncoderFeatures = EncoderFeatureSequence(
+        return EncoderFeatureSequence(
             hiddenSize: view.hiddenSize,
             frameCount: frameCount,
             globalFrameOffset: globalFrameOffset,

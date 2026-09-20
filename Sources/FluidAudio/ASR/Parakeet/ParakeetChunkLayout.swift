@@ -80,6 +80,17 @@ enum ParakeetChunkInference {
         using manager: AsrManager,
         decoderState: inout TdtDecoderState
     ) async throws -> [TokenWindow] {
+        try await transcribeWithPronunciation(
+            work: work, using: manager, decoderState: &decoderState, prototypes: []
+        ).window
+    }
+
+    static func transcribeWithPronunciation(
+        work: ParakeetChunkWork,
+        using manager: AsrManager,
+        decoderState: inout TdtDecoderState,
+        prototypes: [PronunciationEmbedding]
+    ) async throws -> (window: [TokenWindow], matches: [PronunciationWindowMatch]) {
         var preparedPreprocessor: PreparedParakeetPreprocessorHandle? =
             try await manager.prepareParakeetPreprocessorOutput(
                 work.paddedSamples,
@@ -97,6 +108,10 @@ enum ParakeetChunkInference {
             guard let encoder = preparedEncoder else {
                 throw ASRError.processingFailed("Encoder output was not prepared")
             }
+            let matches = try await manager.pronunciationMatches(
+                preparedEncoder: encoder, work: work, prototypes: prototypes
+            )
+            try Task.checkCancellation()
             let output = try await transcribe(
                 work: work,
                 preparedEncoder: encoder,
@@ -104,7 +119,7 @@ enum ParakeetChunkInference {
                 decoderState: &decoderState
             )
             preparedEncoder = nil
-            return try makeTokenWindow(from: output)
+            return (try makeTokenWindow(from: output), matches)
         } catch {
             if let preparedPreprocessor {
                 await manager.discardParakeetPreprocessorOutput(preparedPreprocessor)

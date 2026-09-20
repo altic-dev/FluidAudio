@@ -94,7 +94,52 @@ public enum PronunciationEmbeddingMatcher {
         windowFrameCounts: [[Int]]? = nil,
         stride: Int = 1
     ) -> [PronunciationEmbeddingMatch?] {
-        guard stride > 0 else { return Array(repeating: nil, count: prototypes.count) }
+        var best = [PronunciationEmbeddingMatch?](repeating: nil, count: prototypes.count)
+        scanMatches(prototypes: prototypes, in: sequence, windowFrameCounts: windowFrameCounts, stride: stride) {
+            index, match in
+            if best[index] == nil || match.score > best[index]!.score { best[index] = match }
+        }
+        return best
+    }
+
+    /// Return repeated, non-overlapping occurrences for each prototype, strongest first.
+    public static func allMatches(
+        prototypes: [PronunciationEmbedding],
+        in sequence: EncoderFeatureSequence,
+        threshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold,
+        windowFrameCounts: [[Int]]? = nil,
+        stride: Int = 1
+    ) -> [[PronunciationEmbeddingMatch]] {
+        var candidates = [[PronunciationEmbeddingMatch]](repeating: [], count: prototypes.count)
+        guard threshold.isFinite else { return candidates }
+        scanMatches(prototypes: prototypes, in: sequence, windowFrameCounts: windowFrameCounts, stride: stride) {
+            index, match in
+            if match.score.isFinite && match.score >= threshold { candidates[index].append(match) }
+        }
+        return candidates.map { matches in
+            var accepted: [PronunciationEmbeddingMatch] = []
+            for match in matches.sorted(by: {
+                if $0.score != $1.score { return $0.score > $1.score }
+                if $0.frameRange.lowerBound != $1.frameRange.lowerBound {
+                    return $0.frameRange.lowerBound < $1.frameRange.lowerBound
+                }
+                return $0.frameRange.count < $1.frameRange.count
+            }) {
+                guard !accepted.contains(where: { $0.frameRange.overlaps(match.frameRange) }) else { continue }
+                accepted.append(match)
+            }
+            return accepted
+        }
+    }
+
+    private static func scanMatches(
+        prototypes: [PronunciationEmbedding],
+        in sequence: EncoderFeatureSequence,
+        windowFrameCounts: [[Int]]?,
+        stride: Int,
+        visit: (Int, PronunciationEmbeddingMatch) -> Void
+    ) {
+        guard stride > 0, !prototypes.isEmpty else { return }
         let prefix = prefixSums(for: sequence)
         let requestedCounts: [Set<Int>] = prototypes.enumerated().map { index, prototype in
             guard prototype.values.count == sequence.hiddenSize else { return [] }
@@ -104,7 +149,6 @@ public enum PronunciationEmbeddingMatcher {
             return Set(requestedCounts.filter { $0 > 0 && $0 <= sequence.frameCount })
         }
         let allCounts = Set(requestedCounts.flatMap { $0 }).sorted()
-        var bestMatches = [PronunciationEmbeddingMatch?](repeating: nil, count: prototypes.count)
 
         for count in allCounts {
             let prototypeIndices = prototypes.indices.filter { requestedCounts[$0].contains(count) }
@@ -157,17 +201,15 @@ public enum PronunciationEmbeddingMatcher {
                 let scoreOffset = prototypeOffset * candidates.ranges.count
                 for candidateIndex in candidates.ranges.indices {
                     let score = scores[scoreOffset + candidateIndex]
-                    if bestMatches[prototypeIndex] == nil || score > bestMatches[prototypeIndex]!.score {
-                        bestMatches[prototypeIndex] = PronunciationEmbeddingMatch(
-                            score: score,
-                            frameRange: candidates.ranges[candidateIndex]
-                        )
-                    }
+                    visit(
+                        prototypeIndex,
+                        PronunciationEmbeddingMatch(
+                            score: score, frameRange: candidates.ranges[candidateIndex]
+                        ))
                 }
             }
         }
 
-        return bestMatches
     }
 
     public static func nearbyWindowCounts(around frameCount: Int) -> [Int] {
