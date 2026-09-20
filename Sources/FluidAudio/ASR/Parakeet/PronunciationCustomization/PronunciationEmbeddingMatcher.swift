@@ -141,18 +141,19 @@ public enum PronunciationEmbeddingMatcher {
     ) {
         guard stride > 0, !prototypes.isEmpty else { return }
         let prefix = prefixSums(for: sequence)
-        let requestedCounts: [Set<Int>] = prototypes.enumerated().map { index, prototype in
-            guard prototype.values.count == sequence.hiddenSize else { return [] }
-            let requestedCounts =
-                windowFrameCounts?[safe: index]
-                ?? nearbyWindowCounts(around: prototype.sourceFrameCount)
-            return Set(requestedCounts.filter { $0 > 0 && $0 <= sequence.frameCount })
+        // Group in one pass instead of testing every prototype again for every length.
+        // Appending in prototype order preserves matrix rows and deterministic ties.
+        var prototypesByCount: [Int: [Int]] = [:]
+        for (index, prototype) in prototypes.enumerated() {
+            guard prototype.values.count == sequence.hiddenSize else { continue }
+            let counts = windowFrameCounts?[safe: index] ?? nearbyWindowCounts(around: prototype.sourceFrameCount)
+            for count in Set(counts) where count > 0 && count <= sequence.frameCount {
+                prototypesByCount[count, default: []].append(index)
+            }
         }
-        let allCounts = Set(requestedCounts.flatMap { $0 }).sorted()
 
-        for count in allCounts {
-            let prototypeIndices = prototypes.indices.filter { requestedCounts[$0].contains(count) }
-            guard !prototypeIndices.isEmpty else { continue }
+        for count in prototypesByCount.keys.sorted() {
+            guard let prototypeIndices = prototypesByCount[count] else { continue }
             let candidates = normalizedWindows(
                 in: sequence,
                 prefix: prefix,
@@ -167,10 +168,15 @@ public enum PronunciationEmbeddingMatcher {
                 prototypeValues.append(contentsOf: prototypes[index].values)
             }
             var transposedCandidates = [Float](repeating: 0, count: candidates.values.count)
-            for candidateIndex in candidates.ranges.indices {
-                for hiddenIndex in 0..<sequence.hiddenSize {
-                    transposedCandidates[hiddenIndex * candidates.ranges.count + candidateIndex] =
-                        candidates.values[candidateIndex * sequence.hiddenSize + hiddenIndex]
+            // Transpose without Swift's per-element indexing overhead. This only rearranges
+            // values: scoring and threshold arithmetic remain unchanged.
+            candidates.values.withUnsafeBufferPointer { source in
+                transposedCandidates.withUnsafeMutableBufferPointer { destination in
+                    guard let input = source.baseAddress, let output = destination.baseAddress else { return }
+                    vDSP_mtrans(
+                        input, 1, output, 1,
+                        vDSP_Length(sequence.hiddenSize), vDSP_Length(candidates.ranges.count)
+                    )
                 }
             }
             var scores = [Float](repeating: 0, count: prototypeIndices.count * candidates.ranges.count)
@@ -219,13 +225,16 @@ public enum PronunciationEmbeddingMatcher {
 
     private static func prefixSums(for sequence: EncoderFeatureSequence) -> [Float] {
         var prefix = [Float](repeating: 0, count: (sequence.frameCount + 1) * sequence.hiddenSize)
-        for frameIndex in 0..<sequence.frameCount {
-            let sourceOffset = frameIndex * sequence.hiddenSize
-            let previousOffset = frameIndex * sequence.hiddenSize
-            let destinationOffset = (frameIndex + 1) * sequence.hiddenSize
-            for hiddenIndex in 0..<sequence.hiddenSize {
-                prefix[destinationOffset + hiddenIndex] =
-                    prefix[previousOffset + hiddenIndex] + sequence.values[sourceOffset + hiddenIndex]
+        sequence.values.withUnsafeBufferPointer { source in
+            prefix.withUnsafeMutableBufferPointer { destination in
+                for frameIndex in 0..<sequence.frameCount {
+                    let sourceOffset = frameIndex * sequence.hiddenSize
+                    let destinationOffset = (frameIndex + 1) * sequence.hiddenSize
+                    for hiddenIndex in 0..<sequence.hiddenSize {
+                        destination[destinationOffset + hiddenIndex] =
+                            destination[sourceOffset + hiddenIndex] + source[sourceOffset + hiddenIndex]
+                    }
+                }
             }
         }
         return prefix
@@ -243,32 +252,42 @@ public enum PronunciationEmbeddingMatcher {
         validRanges.reserveCapacity(starts.count)
         var destinationIndex = 0
 
-        for start in starts {
-            let end = start + frameCount
-            let startOffset = start * sequence.hiddenSize
-            let endOffset = end * sequence.hiddenSize
-            let destinationOffset = destinationIndex * sequence.hiddenSize
-            var squaredNorm: Float = 0
-            for hiddenIndex in 0..<sequence.hiddenSize {
-                let sum = prefix[endOffset + hiddenIndex] - prefix[startOffset + hiddenIndex]
-                values[destinationOffset + hiddenIndex] = sum
-                squaredNorm += sum * sum
+        // Normalize four windows together. Each SIMD lane accumulates one window in
+        // the original hidden-dimension order, retaining the scalar scores exactly.
+        prefix.withUnsafeBufferPointer { prefixBuffer in
+            values.withUnsafeMutableBufferPointer { valueBuffer in
+                guard let output = valueBuffer.baseAddress, let source = prefixBuffer.baseAddress else { return }
+                let hidden = sequence.hiddenSize
+                for group in Swift.stride(from: 0, to: starts.count, by: 4) {
+                    let width = min(4, starts.count - group)
+                    let s0 = starts[group] * hidden
+                    let s1 = starts[group + min(1, width - 1)] * hidden
+                    let s2 = starts[group + min(2, width - 1)] * hidden
+                    let s3 = starts[group + min(3, width - 1)] * hidden
+                    let delta = frameCount * hidden
+                    var norms = SIMD4<Float>(repeating: 0)
+                    for h in 0..<hidden {
+                        let before = SIMD4(source[s0 + h], source[s1 + h], source[s2 + h], source[s3 + h])
+                        let after = SIMD4(
+                            source[s0 + delta + h], source[s1 + delta + h], source[s2 + delta + h],
+                            source[s3 + delta + h])
+                        let sums = after - before
+                        norms += sums * sums
+                        for lane in 0..<width { output[(group + lane) * hidden + h] = sums[lane] }
+                    }
+                    for lane in 0..<width {
+                        let norm = norms[lane]
+                        guard norm > 0, norm.isFinite else { continue }
+                        var inverseNorm = 1 / sqrt(norm)
+                        vDSP_vsmul(
+                            output.advanced(by: (group + lane) * hidden), 1, &inverseNorm,
+                            output.advanced(by: destinationIndex * hidden), 1, vDSP_Length(hidden))
+                        let start = starts[group + lane]
+                        validRanges.append(start..<(start + frameCount))
+                        destinationIndex += 1
+                    }
+                }
             }
-            guard squaredNorm > 0, squaredNorm.isFinite else { continue }
-            var inverseNorm = 1 / sqrt(squaredNorm)
-            values.withUnsafeMutableBufferPointer { pointer in
-                guard let baseAddress = pointer.baseAddress else { return }
-                vDSP_vsmul(
-                    baseAddress.advanced(by: destinationOffset),
-                    1,
-                    &inverseNorm,
-                    baseAddress.advanced(by: destinationOffset),
-                    1,
-                    vDSP_Length(sequence.hiddenSize)
-                )
-            }
-            validRanges.append(start..<end)
-            destinationIndex += 1
         }
 
         if destinationIndex * sequence.hiddenSize < values.count {

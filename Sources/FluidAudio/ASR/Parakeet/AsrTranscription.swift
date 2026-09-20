@@ -262,19 +262,10 @@ extension AsrManager {
         prototypes: [PronunciationEmbedding]
     ) throws -> [PronunciationWindowMatch] {
         guard !prototypes.isEmpty else { return [] }
-        guard let output = preparedParakeetEncoderOutputs[handle.id] else {
-            throw ASRError.processingFailed("Prepared pronunciation output is unavailable")
-        }
-        let encoder = try extractFeatureValue(
-            from: output.encoderOutput, key: "encoder", errorMessage: "Invalid encoder output"
-        )
-        let length = try extractFeatureValue(
-            from: output.encoderOutput, key: "encoder_length", errorMessage: "Invalid encoder length"
-        )
         let offset = work.chunkStart / ASRConstants.samplesPerEncoderFrame
         guard
-            let features = try makePronunciationEncoderFeatures(
-                encoder, encoderSequenceLength: length[0].intValue,
+            let features = try pronunciationFeatures(
+                preparedEncoder: handle,
                 actualAudioFrames: ASRConstants.calculateEncoderFrames(from: work.samples.count - work.contextSamples),
                 contextFrameAdjustment: work.contextSamples / ASRConstants.samplesPerEncoderFrame,
                 globalFrameOffset: offset

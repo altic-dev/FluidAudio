@@ -45,3 +45,35 @@ struct PronunciationStreamingTests {
         #expect(windows.stable.count == 2)
     }
 }
+
+@Suite("Batched pronunciation matrix layout")
+struct PronunciationMatrixLayoutTests {
+    @Test("Non-square feature matrices keep scores and prototype routing")
+    func matrixLayout() throws {
+        let features = EncoderFeatureSequence(
+            hiddenSize: 3, frameCount: 7,
+            values: [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0])
+        let prototypes = [
+            PronunciationEmbedding(values: [1, 0, 0], sourceFrameCount: 2),
+            PronunciationEmbedding(values: [0, 1, 0], sourceFrameCount: 2),
+            PronunciationEmbedding(values: [0, 0, 1], sourceFrameCount: 2),
+        ]
+        let hits = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: prototypes, in: features,
+            threshold: 0.99, windowFrameCounts: [[2], [2], [2]])
+        #expect(hits.map { $0.map(\.frameRange) } == [[0..<2], [2..<4], [4..<6]])
+        #expect(hits.flatMap { $0 }.allSatisfy { $0.score == 1 })
+        // Zero-norm windows must compact without overwriting a later SIMD lane or tail.
+        let sparse = EncoderFeatureSequence(
+            hiddenSize: 3, frameCount: 11,
+            values: [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1])
+        let compacted = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: prototypes, in: sparse,
+            threshold: 0.99, windowFrameCounts: [[1], [1], [1]])
+        #expect(compacted.map { $0.map(\.frameRange) } == [[2..<3, 3..<4], [6..<7, 7..<8], [9..<10, 10..<11]])
+        let empty = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: prototypes,
+            in: EncoderFeatureSequence(hiddenSize: 3, frameCount: 3, values: [Float](repeating: 0, count: 9)))
+        #expect(empty.allSatisfy { $0.isEmpty })
+    }
+}
