@@ -264,11 +264,14 @@ public class DownloadUtils {
         return models
     }
 
-    /// Download a HuggingFace repository using URLSession (does not load models)
+    /// Download a HuggingFace repository using URLSession (does not load models).
+    /// - Parameter modelNames: Optional complete artifact selection, overriding the repository default.
+    ///   Used by models with context-specific encoder exports to avoid downloading unused variants.
     public static func downloadRepo(
         _ repo: Repo,
         to directory: URL,
         variant: String? = nil,
+        modelNames: Set<String>? = nil,
         progressHandler: ProgressHandler? = nil
     ) async throws {
         logger.info("Downloading \(repo.folderName) from HuggingFace...")
@@ -276,7 +279,7 @@ public class DownloadUtils {
         let repoPath = directory.appendingPathComponent(repo.folderName)
         try FileManager.default.createDirectory(at: repoPath, withIntermediateDirectories: true)
 
-        let requiredModels = ModelNames.getRequiredModelNames(for: repo, variant: variant)
+        let requiredModels = modelNames ?? ModelNames.getRequiredModelNames(for: repo, variant: variant)
         let subPath = repo.subPath  // e.g., "160ms" for parakeetEou160
 
         // Build patterns for filtering (relative to subPath if present)

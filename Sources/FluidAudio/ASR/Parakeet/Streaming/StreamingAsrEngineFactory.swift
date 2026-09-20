@@ -3,7 +3,7 @@ import Foundation
 
 /// Factory for creating true streaming ASR engines from model variants.
 ///
-/// Only creates engines with native streaming architectures (EOU, Nemotron).
+/// Only creates engines with native streaming architectures (EOU, Nemotron, Unified).
 /// For Parakeet TDT (sliding-window pseudo-streaming), use `SlidingWindowAsrManager` directly.
 ///
 /// Usage:
@@ -34,6 +34,12 @@ public enum StreamingAsrEngineFactory {
 
         case .nemotron:
             return createNemotronEngine(variant: variant, configuration: configuration)
+
+        case .parakeetUnified:
+            let mlConfig = configuration?.copy() as? MLModelConfiguration ?? AsrModels.defaultConfiguration()
+            return StreamingUnifiedAsrManager(
+                configuration: mlConfig, config: variant.unifiedConfig ?? UnifiedConfig()
+            )
         }
     }
 
