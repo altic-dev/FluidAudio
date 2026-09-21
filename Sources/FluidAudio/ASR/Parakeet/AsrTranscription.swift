@@ -259,7 +259,8 @@ extension AsrManager {
     func pronunciationMatches(
         preparedEncoder handle: PreparedParakeetEncoderHandle,
         work: ParakeetChunkWork,
-        prototypes: [PronunciationEmbedding]
+        prototypes: [PronunciationEmbedding],
+        threshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
     ) throws -> [PronunciationWindowMatch] {
         guard !prototypes.isEmpty else { return [] }
         let offset = work.chunkStart / ASRConstants.samplesPerEncoderFrame
@@ -271,7 +272,7 @@ extension AsrManager {
                 globalFrameOffset: offset
             )
         else { return [] }
-        return PronunciationEmbeddingMatcher.allMatches(prototypes: prototypes, in: features)
+        return PronunciationEmbeddingMatcher.allMatches(prototypes: prototypes, in: features, threshold: threshold)
             .enumerated().flatMap { index, matches in
                 matches.map { match in
                     PronunciationWindowMatch(

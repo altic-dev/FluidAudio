@@ -89,7 +89,8 @@ enum ParakeetChunkInference {
         work: ParakeetChunkWork,
         using manager: AsrManager,
         decoderState: inout TdtDecoderState,
-        prototypes: [PronunciationEmbedding]
+        prototypes: [PronunciationEmbedding],
+        threshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
     ) async throws -> (window: [TokenWindow], matches: [PronunciationWindowMatch]) {
         var preparedPreprocessor: PreparedParakeetPreprocessorHandle? =
             try await manager.prepareParakeetPreprocessorOutput(
@@ -109,7 +110,7 @@ enum ParakeetChunkInference {
                 throw ASRError.processingFailed("Encoder output was not prepared")
             }
             let matches = try await manager.pronunciationMatches(
-                preparedEncoder: encoder, work: work, prototypes: prototypes
+                preparedEncoder: encoder, work: work, prototypes: prototypes, threshold: threshold
             )
             try Task.checkCancellation()
             let output = try await transcribe(

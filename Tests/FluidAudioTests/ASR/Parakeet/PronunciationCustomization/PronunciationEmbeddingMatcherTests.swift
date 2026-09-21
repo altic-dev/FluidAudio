@@ -5,6 +5,23 @@ import Testing
 
 @Suite("Parakeet pronunciation embedding matcher")
 struct PronunciationEmbeddingMatcherTests {
+    @Test("A custom cutoff retains a near miss without changing the default")
+    func customCutoffRetainsNearMiss() throws {
+        // Encoder-space vectors only; this checks the score gate without an audio model.
+        let features = EncoderFeatureSequence(hiddenSize: 2, frameCount: 1, values: [0.5, 0.8660254])
+        let prototype = PronunciationEmbedding(values: [1, 0], sourceFrameCount: 1)
+        let defaults = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: [prototype], in: features, windowFrameCounts: [[1]])
+        let forgiving = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: [prototype], in: features, threshold: 0.45, windowFrameCounts: [[1]])
+        let strict = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: [prototype], in: features, threshold: 0.6, windowFrameCounts: [[1]])
+        #expect(defaults[0].isEmpty)
+        #expect(strict[0].isEmpty)
+        let match = try #require(forgiving[0].first)
+        #expect(abs(match.score - 0.5) < 0.0001)
+    }
+
     @Test("Pronunciation capture is explicitly opt-in")
     func captureOptInLifecycle() async {
         let manager = AsrManager()

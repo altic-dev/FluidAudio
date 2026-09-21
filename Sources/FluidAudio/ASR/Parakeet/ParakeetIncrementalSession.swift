@@ -97,6 +97,7 @@ public actor ParakeetIncrementalSession {
     private var lifecycle = Lifecycle.active
     private var operationInFlight = false
     private let pronunciationPrototypes: [PronunciationEmbedding]
+    private let pronunciationThreshold: Float
     private var pronunciationWindows = PronunciationWindowMatches()
 
     /// Latest decoded text before optional vocabulary rescoring changes its spelling.
@@ -107,12 +108,14 @@ public actor ParakeetIncrementalSession {
 
     init(
         manager: AsrManager, source: AudioSource, appliesVocabularyBoosting: Bool,
-        pronunciationPrototypes: [PronunciationEmbedding] = []
+        pronunciationPrototypes: [PronunciationEmbedding] = [],
+        pronunciationThreshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
     ) {
         self.manager = manager
         self.source = source
         self.appliesVocabularyBoosting = appliesVocabularyBoosting
         self.pronunciationPrototypes = pronunciationPrototypes
+        self.pronunciationThreshold = pronunciationThreshold
     }
 
     /// Number of source samples accepted by this session.
@@ -267,7 +270,7 @@ public actor ParakeetIncrementalSession {
             let output = try await ParakeetChunkInference.transcribeWithPronunciation(
                 work: work,
                 using: manager,
-                decoderState: &decoderState, prototypes: pronunciationPrototypes
+                decoderState: &decoderState, prototypes: pronunciationPrototypes, threshold: pronunciationThreshold
             )
             try Task.checkCancellation()
             pronunciationWindows.finalize(output.matches)
@@ -297,7 +300,8 @@ public actor ParakeetIncrementalSession {
         var decoderState = TdtDecoderState.make(decoderLayers: await manager.getDecoderLayers())
         decoderState.reset()
         let output = try await ParakeetChunkInference.transcribeWithPronunciation(
-            work: work, using: manager, decoderState: &decoderState, prototypes: pronunciationPrototypes
+            work: work, using: manager, decoderState: &decoderState, prototypes: pronunciationPrototypes,
+            threshold: pronunciationThreshold
         )
         try Task.checkCancellation()
         pronunciationWindows.replaceTail(output.matches)
@@ -334,14 +338,16 @@ extension AsrManager {
     /// Pass the complete waveform to `finish(finalAudioSamples:)` when vocabulary boosting is configured.
     public func makeIncrementalSession(
         source: AudioSource = .microphone,
-        pronunciationPrototypes: [PronunciationEmbedding] = []
+        pronunciationPrototypes: [PronunciationEmbedding] = [],
+        pronunciationThreshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
     ) throws -> ParakeetIncrementalSession {
         guard isAvailable else { throw ASRError.notInitialized }
         return ParakeetIncrementalSession(
             manager: self,
             source: source,
             appliesVocabularyBoosting: vocabBoostingEnabled,
-            pronunciationPrototypes: pronunciationPrototypes
+            pronunciationPrototypes: pronunciationPrototypes,
+            pronunciationThreshold: pronunciationThreshold
         )
     }
 }
