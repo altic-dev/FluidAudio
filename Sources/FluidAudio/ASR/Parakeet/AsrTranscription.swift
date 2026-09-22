@@ -256,13 +256,13 @@ extension AsrManager {
 
     /// Reads the output owned by this handle before decoding releases its backing buffers.
     /// No global capture flag or latest-feature slot is involved.
-    func pronunciationMatches(
+    func pronunciationAnalysis(
         preparedEncoder handle: PreparedParakeetEncoderHandle,
         work: ParakeetChunkWork,
         prototypes: [PronunciationEmbedding],
         threshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
-    ) throws -> [PronunciationWindowMatch] {
-        guard !prototypes.isEmpty else { return [] }
+    ) throws -> (matches: [PronunciationWindowMatch], features: EncoderFeatureSequence?) {
+        guard !prototypes.isEmpty else { return ([], nil) }
         let offset = work.chunkStart / ASRConstants.samplesPerEncoderFrame
         guard
             let features = try pronunciationFeatures(
@@ -271,16 +271,19 @@ extension AsrManager {
                 contextFrameAdjustment: work.contextSamples / ASRConstants.samplesPerEncoderFrame,
                 globalFrameOffset: offset
             )
-        else { return [] }
-        return PronunciationEmbeddingMatcher.allMatches(prototypes: prototypes, in: features, threshold: threshold)
-            .enumerated().flatMap { index, matches in
-                matches.map { match in
-                    PronunciationWindowMatch(
-                        prototypeIndex: index, score: match.score,
-                        frameRange: (offset + match.frameRange.lowerBound)..<(offset + match.frameRange.upperBound)
-                    )
-                }
+        else { return ([], nil) }
+        let matches = PronunciationEmbeddingMatcher.allMatches(
+            prototypes: prototypes, in: features, threshold: threshold
+        )
+        .enumerated().flatMap { index, matches in
+            matches.map { match in
+                PronunciationWindowMatch(
+                    prototypeIndex: index, score: match.score,
+                    frameRange: (offset + match.frameRange.lowerBound)..<(offset + match.frameRange.upperBound)
+                )
             }
+        }
+        return (matches, features)
     }
 
     func executeMLInferenceWithTimings(

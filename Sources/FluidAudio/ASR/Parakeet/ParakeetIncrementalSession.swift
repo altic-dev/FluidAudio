@@ -77,6 +77,18 @@ struct ParakeetIncrementalState: Sendable {
 /// The session intentionally uses the same chunk layout, inference path, and overlap merger as
 /// `AsrManager.transcribe`. Only the unfinished tail is reprocessed for previews and finalization.
 /// Keep one session per recording and append only newly captured 16 kHz mono PCM samples.
+/// A temporary window from normal recognition. Samples, token times and feature indices are
+/// window-local; sampleOffset maps accepted matches back into the recording. Not retained by the session.
+public struct PronunciationChunk: Sendable {
+    public let sampleOffset: Int
+    public let samples: [Float]
+    public let features: EncoderFeatureSequence
+    public let result: ASRResult
+    public let matches: [PronunciationWindowMatch]
+}
+
+public typealias PronunciationChunkRefiner = @Sendable (PronunciationChunk) async throws -> [PronunciationWindowMatch]
+
 public actor ParakeetIncrementalSession {
     private typealias TokenWindow = AsrChunkTokenMerger.TokenWindow
 
@@ -98,24 +110,32 @@ public actor ParakeetIncrementalSession {
     private var operationInFlight = false
     private let pronunciationPrototypes: [PronunciationEmbedding]
     private let pronunciationThreshold: Float
+    private let pronunciationRefiner: PronunciationChunkRefiner?
+    private let pronunciationEnabled: (@Sendable () -> Bool)?
     private var pronunciationWindows = PronunciationWindowMatches()
 
     /// Latest decoded text before optional vocabulary rescoring changes its spelling.
     public var unboostedText: String? { lastPreviewResult?.text }
 
     /// Includes stable hits plus the current tail, in recording-global encoder frames.
-    public var pronunciationMatches: [PronunciationWindowMatch] { pronunciationWindows.all }
+    public var pronunciationMatches: [PronunciationWindowMatch] {
+        pronunciationEnabled?() == false ? [] : pronunciationWindows.all
+    }
 
     init(
         manager: AsrManager, source: AudioSource, appliesVocabularyBoosting: Bool,
         pronunciationPrototypes: [PronunciationEmbedding] = [],
-        pronunciationThreshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
+        pronunciationThreshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold,
+        pronunciationRefiner: PronunciationChunkRefiner? = nil,
+        pronunciationEnabled: (@Sendable () -> Bool)? = nil
     ) {
         self.manager = manager
         self.source = source
         self.appliesVocabularyBoosting = appliesVocabularyBoosting
         self.pronunciationPrototypes = pronunciationPrototypes
         self.pronunciationThreshold = pronunciationThreshold
+        self.pronunciationRefiner = pronunciationRefiner
+        self.pronunciationEnabled = pronunciationEnabled
     }
 
     /// Number of source samples accepted by this session.
@@ -270,7 +290,8 @@ public actor ParakeetIncrementalSession {
             let output = try await ParakeetChunkInference.transcribeWithPronunciation(
                 work: work,
                 using: manager,
-                decoderState: &decoderState, prototypes: pronunciationPrototypes, threshold: pronunciationThreshold
+                decoderState: &decoderState, prototypes: pronunciationPrototypes, threshold: pronunciationThreshold,
+                pronunciationRefiner: pronunciationRefiner, pronunciationEnabled: pronunciationEnabled
             )
             try Task.checkCancellation()
             pronunciationWindows.finalize(output.matches)
@@ -301,7 +322,8 @@ public actor ParakeetIncrementalSession {
         decoderState.reset()
         let output = try await ParakeetChunkInference.transcribeWithPronunciation(
             work: work, using: manager, decoderState: &decoderState, prototypes: pronunciationPrototypes,
-            threshold: pronunciationThreshold
+            threshold: pronunciationThreshold, pronunciationRefiner: pronunciationRefiner,
+            pronunciationEnabled: pronunciationEnabled
         )
         try Task.checkCancellation()
         pronunciationWindows.replaceTail(output.matches)
@@ -335,11 +357,14 @@ public actor ParakeetIncrementalSession {
 
 extension AsrManager {
     /// Creates an incremental session that is text-equivalent to batch Parakeet chunking.
+    /// `pronunciationEnabled` is checked for each window; false skips pronunciation work without resetting speech.
     /// Pass the complete waveform to `finish(finalAudioSamples:)` when vocabulary boosting is configured.
     public func makeIncrementalSession(
         source: AudioSource = .microphone,
         pronunciationPrototypes: [PronunciationEmbedding] = [],
-        pronunciationThreshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
+        pronunciationThreshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold,
+        pronunciationRefiner: PronunciationChunkRefiner? = nil,
+        pronunciationEnabled: (@Sendable () -> Bool)? = nil
     ) throws -> ParakeetIncrementalSession {
         guard isAvailable else { throw ASRError.notInitialized }
         return ParakeetIncrementalSession(
@@ -347,7 +372,8 @@ extension AsrManager {
             source: source,
             appliesVocabularyBoosting: vocabBoostingEnabled,
             pronunciationPrototypes: pronunciationPrototypes,
-            pronunciationThreshold: pronunciationThreshold
+            pronunciationThreshold: pronunciationThreshold, pronunciationRefiner: pronunciationRefiner,
+            pronunciationEnabled: pronunciationEnabled
         )
     }
 }

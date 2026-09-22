@@ -90,7 +90,9 @@ enum ParakeetChunkInference {
         using manager: AsrManager,
         decoderState: inout TdtDecoderState,
         prototypes: [PronunciationEmbedding],
-        threshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold
+        threshold: Float = PronunciationCustomizationDefaults.acceptanceThreshold,
+        pronunciationRefiner: PronunciationChunkRefiner? = nil,
+        pronunciationEnabled: (@Sendable () -> Bool)? = nil
     ) async throws -> (window: [TokenWindow], matches: [PronunciationWindowMatch]) {
         var preparedPreprocessor: PreparedParakeetPreprocessorHandle? =
             try await manager.prepareParakeetPreprocessorOutput(
@@ -109,8 +111,9 @@ enum ParakeetChunkInference {
             guard let encoder = preparedEncoder else {
                 throw ASRError.processingFailed("Encoder output was not prepared")
             }
-            let matches = try await manager.pronunciationMatches(
-                preparedEncoder: encoder, work: work, prototypes: prototypes, threshold: threshold
+            let analysis = try await manager.pronunciationAnalysis(
+                preparedEncoder: encoder, work: work,
+                prototypes: pronunciationEnabled?() == false ? [] : prototypes, threshold: threshold
             )
             try Task.checkCancellation()
             let output = try await transcribe(
@@ -120,7 +123,35 @@ enum ParakeetChunkInference {
                 decoderState: &decoderState
             )
             preparedEncoder = nil
-            return (try makeTokenWindow(from: output), matches)
+            var matches = analysis.matches
+            if pronunciationEnabled?() != false, let pronunciationRefiner, let captured = analysis.features {
+                let offset = work.chunkStart / ASRConstants.samplesPerEncoderFrame
+                let result = await manager.processTranscriptionResult(
+                    tokenIds: output.tokens, timestamps: output.timestamps.map { $0 - offset },
+                    confidences: output.confidences, tokenDurations: output.durations,
+                    encoderSequenceLength: 0, audioSamples: [], processingTime: 0,
+                    audioSampleCount: work.samples.count - work.contextSamples
+                )
+                let features = EncoderFeatureSequence(
+                    hiddenSize: captured.hiddenSize, frameCount: captured.frameCount, values: captured.values)
+                let localMatches = matches.map {
+                    PronunciationWindowMatch(
+                        prototypeIndex: $0.prototypeIndex, score: $0.score,
+                        frameRange: ($0.frameRange.lowerBound - offset)..<($0.frameRange.upperBound - offset))
+                }
+                let refined = try await pronunciationRefiner(
+                    PronunciationChunk(
+                        sampleOffset: work.chunkStart, samples: Array(work.samples.dropFirst(work.contextSamples)),
+                        features: features, result: result, matches: localMatches
+                    ))
+                try Task.checkCancellation()
+                matches = refined.map {
+                    PronunciationWindowMatch(
+                        prototypeIndex: $0.prototypeIndex, score: $0.score,
+                        frameRange: ($0.frameRange.lowerBound + offset)..<($0.frameRange.upperBound + offset))
+                }
+            }
+            return (try makeTokenWindow(from: output), pronunciationEnabled?() == false ? [] : matches)
         } catch {
             if let preparedPreprocessor {
                 await manager.discardParakeetPreprocessorOutput(preparedPreprocessor)
