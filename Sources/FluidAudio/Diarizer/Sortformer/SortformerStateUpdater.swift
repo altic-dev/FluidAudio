@@ -209,6 +209,8 @@ public struct SortformerStateUpdater {
         preds: [Float],
         frameCount: Int
     ) {
+        // A trained silence embedding is fixed; only the running-mean fallback learns from audio.
+        guard config.learnedSilenceEmbedding == nil else { return }
         let fcDModel = config.preEncoderDims
         let numSpeakers = config.numSpeakers
         let silThreshold = config.silenceThreshold

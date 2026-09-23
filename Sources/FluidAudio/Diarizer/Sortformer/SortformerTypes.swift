@@ -184,6 +184,11 @@ public struct SortformerConfig: Sendable {
     /// Silence frames per speaker in compressed cache
     public var spkcacheSilFramesPerSpk: Int = 3
 
+    /// Trained silence embedding for speaker-cache placeholders (NeMo `use_learnable_sil_emb`).
+    /// When set, it replaces the running mean of silent frames, which is then never updated.
+    /// Must hold exactly `preEncoderDims` finite values.
+    public var learnedSilenceEmbedding: [Float]?
+
     // MARK: - Debug
 
     /// Enable debug logging
@@ -434,6 +439,17 @@ public struct SortformerConfig: Sendable {
         if spkcacheSilFramesPerSpk < 0 {
             problems.append("spkcacheSilFramesPerSpk must be >= 0 (got \(spkcacheSilFramesPerSpk))")
         }
+        if let learnedSilenceEmbedding {
+            if learnedSilenceEmbedding.count != preEncoderDims {
+                problems.append(
+                    "learnedSilenceEmbedding must have preEncoderDims = \(preEncoderDims) values "
+                        + "(got \(learnedSilenceEmbedding.count))"
+                )
+            }
+            if !learnedSilenceEmbedding.allSatisfy(\.isFinite) {
+                problems.append("learnedSilenceEmbedding must contain only finite values")
+            }
+        }
 
         // Cache compression budgets one slice of the speaker cache per speaker and reserves
         // `spkcacheSilFramesPerSpk` of it for silence placeholders; the remainder must stay positive.
@@ -563,7 +579,8 @@ public struct SortformerStreamingState: Sendable {
         self.fifo.reserveCapacity((config.fifoLen + config.chunkLen) * config.preEncoderDims)
         self.spkcache.reserveCapacity((config.spkcacheLen + config.spkcacheUpdatePeriod) * config.preEncoderDims)
 
-        self.meanSilenceEmbedding = [Float](repeating: 0.0, count: config.preEncoderDims)
+        self.meanSilenceEmbedding =
+            config.learnedSilenceEmbedding ?? [Float](repeating: 0.0, count: config.preEncoderDims)
         self.silenceFrameCount = 0
     }
 

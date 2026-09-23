@@ -29,6 +29,61 @@ final class SortformerNemotronCompatibilityTests: XCTestCase {
         )
     }
 
+    /// Runs one first-chunk update whose frames are all silent, which overflows the FIFO and pops
+    /// frames through the silence-profile update.
+    private func silentFirstUpdate(config: SortformerConfig) throws -> SortformerStreamingState {
+        var state = SortformerStreamingState(config: config)
+        _ = try SortformerStateUpdater(config: config).streamingUpdate(
+            state: &state,
+            chunk: [Float](repeating: 1, count: config.chunkEncoderFrames * config.preEncoderDims),
+            preds: [Float](repeating: 0, count: config.chunkEncoderFrames * config.numSpeakers),
+            leftContext: config.chunkLeftContext,
+            rightContext: config.chunkRightContext
+        )
+        return state
+    }
+
+    func testLearnedSilenceEmbeddingIsUsedAndNeverUpdated() throws {
+        let learned = (0..<512).map { Float($0) / 512 }
+        let config = try SortformerConfig.nemotron(
+            spkcacheUpdatePeriod: 300, spkcacheSilFramesPerSpk: 1, predScoreThreshold: 0.25,
+            learnedSilenceEmbedding: learned
+        )
+        XCTAssertEqual(SortformerStreamingState(config: config).meanSilenceEmbedding, learned)
+
+        let state = try self.silentFirstUpdate(config: config)
+
+        XCTAssertEqual(state.meanSilenceEmbedding, learned)
+        XCTAssertEqual(state.silenceFrameCount, 0)
+    }
+
+    func testRunningMeanSilenceStillLearnsWithoutLearnedEmbedding() throws {
+        let config = try SortformerConfig.nemotron(
+            spkcacheUpdatePeriod: 300, spkcacheSilFramesPerSpk: 1, predScoreThreshold: 0.25
+        )
+        XCTAssertNil(config.learnedSilenceEmbedding)
+
+        let state = try self.silentFirstUpdate(config: config)
+
+        XCTAssertGreaterThan(state.silenceFrameCount, 0)
+        XCTAssertEqual(state.meanSilenceEmbedding, [Float](repeating: 1, count: 512))
+    }
+
+    func testLearnedSilenceEmbeddingMustMatchEmbeddingWidth() {
+        XCTAssertThrowsError(
+            try SortformerConfig.nemotron(
+                spkcacheUpdatePeriod: 300, spkcacheSilFramesPerSpk: 1, predScoreThreshold: 0.25,
+                learnedSilenceEmbedding: [0, 0, 0]
+            )
+        )
+        XCTAssertThrowsError(
+            try SortformerConfig.nemotron(
+                spkcacheUpdatePeriod: 300, spkcacheSilFramesPerSpk: 1, predScoreThreshold: 0.25,
+                learnedSilenceEmbedding: [Float](repeating: .nan, count: 512)
+            )
+        )
+    }
+
     func testExplicitNemotronCadenceAndLegacyDefaults() throws {
         let config = try configuration()
         XCTAssertEqual(config.melFrontend.family, .nemotron3Diarization)

@@ -55,7 +55,7 @@ extension SortformerConfig {
         ///
         /// - Important: This value is **not** verified against the upstream NeMo checkpoint; it is
         ///   recorded here only so callers can pass it explicitly. See the note on
-        ///   ``SortformerConfig/nemotron(spkcacheUpdatePeriod:spkcacheSilFramesPerSpk:predScoreThreshold:silenceThreshold:scoresBoostLatest:strongBoostRate:weakBoostRate:minPosScoresRate:debugMode:)``
+        ///   ``SortformerConfig/nemotron(spkcacheUpdatePeriod:spkcacheSilFramesPerSpk:predScoreThreshold:silenceThreshold:scoresBoostLatest:strongBoostRate:weakBoostRate:minPosScoresRate:learnedSilenceEmbedding:debugMode:)``
         ///   for how it differs from the generic initializer's clamp.
         public static let referenceScriptSpkcacheUpdatePeriod = 300
 
@@ -101,6 +101,8 @@ extension SortformerConfig {
     ///     compression. Must satisfy `spkcacheLen / numSpeakers - value > 0`, i.e. `< 33`.
     ///   - predScoreThreshold: Probability clamp used when scoring cached frames for compression.
     ///   - silenceThreshold: Summed-probability threshold below which a frame updates the silence profile.
+    ///   - learnedSilenceEmbedding: The checkpoint's trained silence embedding (`learnable_sil_emb`).
+    ///     Nemotron 3 is trained with it; without it, cache compression falls back to a running mean.
     ///   - debugMode: Enable verbose logging.
     /// - Throws: `SortformerError.configurationError` if the resulting geometry is unusable.
     public static func nemotron(
@@ -112,6 +114,7 @@ extension SortformerConfig {
         strongBoostRate: Float = 0.75,
         weakBoostRate: Float = 1.5,
         minPosScoresRate: Float = 0.5,
+        learnedSilenceEmbedding: [Float]? = nil,
         debugMode: Bool = false
     ) throws -> SortformerConfig {
         try NemotronGeometry.validate(spkcacheUpdatePeriod: spkcacheUpdatePeriod)
@@ -143,6 +146,7 @@ extension SortformerConfig {
 
         // Preserve the caller's explicit reference cadence after the generic legacy clamp.
         config.spkcacheUpdatePeriod = spkcacheUpdatePeriod
+        config.learnedSilenceEmbedding = learnedSilenceEmbedding
         guard config.spkcacheLen == NemotronGeometry.spkcacheLen else {
             throw SortformerError.configurationError(
                 "spkcacheSilFramesPerSpk \(spkcacheSilFramesPerSpk) forces spkcacheLen to "
