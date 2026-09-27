@@ -17,7 +17,9 @@ public class Tokenizer {
 
     public init(vocabPath: URL) throws {
         let data = try Data(contentsOf: vocabPath)
-        let json = try JSONSerialization.jsonObject(with: data, options: []) as! [String: String]
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            throw ASRError.processingFailed("Invalid tokenizer vocabulary at \(vocabPath.lastPathComponent)")
+        }
 
         self.vocab = json
         for (key, value) in json {
@@ -35,6 +37,11 @@ public class Tokenizer {
             self.idToToken[id] = piece.piece
             self.vocab[String(id)] = piece.piece
         }
+    }
+
+    /// Return a raw vocabulary piece, preserving SentencePiece word boundaries.
+    public func piece(forId id: Int) -> String? {
+        idToToken[id]
     }
 
     public func decode(ids: [Int], skipSpecialTokens: Bool = false) -> String {

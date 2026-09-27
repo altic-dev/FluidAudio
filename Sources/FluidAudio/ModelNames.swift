@@ -4,6 +4,7 @@ import Foundation
 public enum Repo: String, CaseIterable {
     case vad = "FluidInference/silero-vad-coreml"
     case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
+    case parakeetUnified = "FluidInference/parakeet-unified-en-0.6b-coreml"
     case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
     case parakeetCtc110m = "FluidInference/parakeet-ctc-110m-coreml"
     case parakeetCtc06b = "FluidInference/parakeet-ctc-0.6b-coreml"
@@ -29,6 +30,8 @@ public enum Repo: String, CaseIterable {
             return "silero-vad-coreml"
         case .parakeet:
             return "parakeet-tdt-0.6b-v3-coreml"
+        case .parakeetUnified:
+            return "parakeet-unified-en-0.6b-coreml"
         case .parakeetV2:
             return "parakeet-tdt-0.6b-v2-coreml"
         case .parakeetCtc110m:
@@ -273,6 +276,32 @@ public enum ModelNames {
             jointFile,
             vocab,
         ]
+    }
+
+    /// Parakeet Unified 0.6B streaming model artifacts.
+    public enum ParakeetUnified {
+        public static let decoderFile = "parakeet_unified_decoder.mlmodelc"
+        public static let jointDecisionFile = "parakeet_unified_joint_decision_single_step.mlmodelc"
+        public static let vocab = "vocab.json"
+        public static let metadata = "metadata.json"
+
+        /// Each attention context is baked into a separate encoder bundle.
+        public static func streamingEncoderFile(
+            precision: UnifiedEncoderPrecision, contextSuffix: String = "70_13_13"
+        ) -> String {
+            let base = "parakeet_unified_encoder_streaming_\(contextSuffix)"
+            return precision == .int8 ? "\(base)_int8.mlmodelc" : "\(base).mlmodelc"
+        }
+
+        /// The selected encoder and its shared decoder, joint, vocabulary and metadata.
+        public static func requiredModels(
+            config: UnifiedConfig = UnifiedConfig(), precision: UnifiedEncoderPrecision = .int8
+        ) -> Set<String> {
+            [
+                streamingEncoderFile(precision: precision, contextSuffix: config.contextSuffix),
+                decoderFile, jointDecisionFile, vocab, metadata,
+            ]
+        }
     }
 
     /// Nemotron Speech Streaming 0.6B model names
@@ -580,6 +609,8 @@ public enum ModelNames {
             return ModelNames.VAD.requiredModels
         case .parakeet, .parakeetV2:
             return ModelNames.ASR.requiredModels
+        case .parakeetUnified:
+            return ModelNames.ParakeetUnified.requiredModels()
         case .parakeetTdtCtc110m:
             return ModelNames.ASR.requiredModelsFused
         case .parakeetCtc110m, .parakeetCtc06b:

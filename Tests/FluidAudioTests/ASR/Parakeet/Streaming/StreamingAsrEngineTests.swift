@@ -30,8 +30,8 @@ final class StreamingAsrEngineTests: XCTestCase {
     // MARK: - StreamingModelVariant Tests
 
     func testAllVariantsCount() {
-        // 3 EOU + 2 Nemotron = 5 streaming variants
-        XCTAssertEqual(StreamingModelVariant.allCases.count, 5)
+        // 3 EOU + 2 Nemotron + 4 Unified streaming variants
+        XCTAssertEqual(StreamingModelVariant.allCases.count, 9)
     }
 
     func testAllVariantsHaveDisplayName() {
