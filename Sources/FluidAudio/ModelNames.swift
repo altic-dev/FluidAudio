@@ -21,6 +21,9 @@ public enum Repo: String, CaseIterable {
     case qwen3AsrInt8 = "FluidInference/qwen3-asr-0.6b-coreml/int8"
     case multilingualG2p = "FluidInference/charsiu-g2p-byt5-coreml"
     case parakeetTdtCtc110m = "FluidInference/parakeet-tdt-ctc-110m-coreml"
+    /// Cache/artifact identity for local hosted packs; AsrModels does not auto-download these from HF.
+    case fluidParakeetMini = "altic-dev/fluid-parakeet-mini-coreml"
+    case fluidParakeetPico = "altic-dev/fluid-parakeet-pico-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
@@ -63,6 +66,10 @@ public enum Repo: String, CaseIterable {
             return "charsiu-g2p-byt5-coreml"
         case .parakeetTdtCtc110m:
             return "parakeet-tdt-ctc-110m-coreml"
+        case .fluidParakeetMini:
+            return "fluid-parakeet-mini-coreml"
+        case .fluidParakeetPico:
+            return "fluid-parakeet-pico-coreml"
         }
     }
 
@@ -85,6 +92,8 @@ public enum Repo: String, CaseIterable {
             return "FluidInference/qwen3-asr-0.6b-coreml"
         case .parakeetTdtCtc110m:
             return "FluidInference/parakeet-tdt-ctc-110m-coreml"
+        case .fluidParakeetMini, .fluidParakeetPico:
+            return rawValue
         default:
             return "FluidInference/\(name)"
         }
@@ -578,7 +587,7 @@ public enum ModelNames {
         switch repo {
         case .vad:
             return ModelNames.VAD.requiredModels
-        case .parakeet, .parakeetV2:
+        case .parakeet, .parakeetV2, .fluidParakeetMini, .fluidParakeetPico:
             return ModelNames.ASR.requiredModels
         case .parakeetTdtCtc110m:
             return ModelNames.ASR.requiredModelsFused

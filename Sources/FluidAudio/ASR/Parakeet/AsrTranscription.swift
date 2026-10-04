@@ -23,7 +23,7 @@ struct ParakeetEncoderOutput {
 
 extension AsrManager {
     func supportsParakeetFrontendPipelining() -> Bool {
-        encoderModel != nil
+        encoderModel != nil || splitEncoder != nil
     }
 
     internal func transcribeWithState(
@@ -180,7 +180,7 @@ extension AsrManager {
             )
             let storedOutput =
                 snapshotOutput
-                ? try Self.snapshotFeatureProvider(preprocessorOutput)
+                ? try AsrModels.snapshotFeatureProvider(preprocessorOutput)
                 : preprocessorOutput
 
             let handle = PreparedParakeetPreprocessorHandle(id: UUID())
@@ -209,16 +209,19 @@ extension AsrManager {
         var ownedBackings: [MLMultiArray] = []
         do {
             let encoderOutputProvider: MLFeatureProvider
-            if let encoderModel {
+            let inputNames =
+                asrModels?.encoderInputFeatureNames
+                ?? encoderModel?.modelDescription.inputDescriptionsByName.keys.sorted() ?? []
+            if !inputNames.isEmpty {
                 let encoderInput = try prepareEncoderInput(
-                    encoder: encoderModel,
+                    inputNames: inputNames,
                     preprocessorOutput: preparedOutput.output,
                     originalInput: preparedOutput.input
                 )
 
                 try Task.checkCancellation()
                 let encoderPredictionOptions: MLPredictionOptions
-                if snapshotOutput {
+                if snapshotOutput, let encoderModel {
                     let backings = try await makeOutputBackings(for: encoderModel)
                     let options = AsrModels.optimizedPredictionOptions()
                     options.outputBackings = backings
@@ -227,10 +230,16 @@ extension AsrManager {
                 } else {
                     encoderPredictionOptions = predictionOptions
                 }
-                encoderOutputProvider = try await encoderModel.compatPrediction(
-                    from: encoderInput,
-                    options: encoderPredictionOptions
-                )
+                let output: MLFeatureProvider
+                if let models = asrModels {
+                    output = try await models.predictEncoder(from: encoderInput, options: encoderPredictionOptions)
+                } else if let encoderModel {
+                    output = try await encoderModel.compatPrediction(
+                        from: encoderInput, options: encoderPredictionOptions)
+                } else {
+                    throw ASRError.notInitialized
+                }
+                encoderOutputProvider = output
             } else {
                 encoderOutputProvider = preparedOutput.output
             }
@@ -384,46 +393,6 @@ extension AsrManager {
         }
     }
 
-    private static func snapshotFeatureProvider(
-        _ provider: MLFeatureProvider
-    ) throws -> MLFeatureProvider {
-        var features: [String: MLFeatureValue] = [:]
-        for name in provider.featureNames {
-            guard let value = provider.featureValue(for: name) else { continue }
-            if let array = value.multiArrayValue {
-                features[name] = MLFeatureValue(multiArray: try snapshotMultiArray(array))
-            } else {
-                features[name] = value
-            }
-        }
-        return try MLDictionaryFeatureProvider(dictionary: features)
-    }
-
-    private static func snapshotMultiArray(_ source: MLMultiArray) throws -> MLMultiArray {
-        let storageElementCount = zip(source.shape, source.strides).reduce(1) { extent, pair in
-            let (dimension, stride) = pair
-            return extent + max(0, dimension.intValue - 1) * stride.intValue
-        }
-        let byteCount = storageElementCount * ANEMemoryUtils.getElementSize(for: source.dataType)
-        let storage = UnsafeMutableRawPointer.allocate(byteCount: max(byteCount, 1), alignment: 64)
-        if byteCount > 0 {
-            memcpy(storage, source.dataPointer, byteCount)
-        }
-
-        do {
-            return try MLMultiArray(
-                dataPointer: storage,
-                shape: source.shape,
-                dataType: source.dataType,
-                strides: source.strides,
-                deallocator: { pointer in pointer.deallocate() }
-            )
-        } catch {
-            storage.deallocate()
-            throw error
-        }
-    }
-
     private func returnEncoderOutputBackings(_ backings: [MLMultiArray]) async {
         for backing in backings {
             await sharedMLArrayCache.returnArray(backing)
@@ -431,13 +400,11 @@ extension AsrManager {
     }
 
     private func prepareEncoderInput(
-        encoder: MLModel,
+        inputNames: [String],
         preprocessorOutput: MLFeatureProvider,
         originalInput: MLFeatureProvider
     ) throws -> MLFeatureProvider {
-        let inputDescriptions = encoder.modelDescription.inputDescriptionsByName
-
-        let missingNames = inputDescriptions.keys.filter { name in
+        let missingNames = inputNames.filter { name in
             preprocessorOutput.featureValue(for: name) == nil
         }
 
@@ -447,7 +414,7 @@ extension AsrManager {
 
         var features: [String: MLFeatureValue] = [:]
 
-        for name in inputDescriptions.keys {
+        for name in inputNames {
             if let value = preprocessorOutput.featureValue(for: name) {
                 features[name] = value
                 continue

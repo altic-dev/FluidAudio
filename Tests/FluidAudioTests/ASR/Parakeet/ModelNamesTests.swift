@@ -8,10 +8,12 @@ final class ModelNamesTests: XCTestCase {
     // MARK: - Repo
 
     func testRepoRemotePathContainsOwner() {
+        let fluidParakeetRepos: Set<Repo> = [.fluidParakeetMini, .fluidParakeetPico]
         for repo in Repo.allCases {
+            let owner = fluidParakeetRepos.contains(repo) ? "altic-dev/" : "FluidInference/"
             XCTAssertTrue(
-                repo.remotePath.contains("FluidInference/"),
-                "\(repo) remotePath should contain 'FluidInference/'"
+                repo.remotePath.hasPrefix(owner),
+                "\(repo) remotePath should start with '\(owner)'"
             )
         }
     }
