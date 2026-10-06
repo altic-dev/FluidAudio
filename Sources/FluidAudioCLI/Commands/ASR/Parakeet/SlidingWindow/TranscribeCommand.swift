@@ -263,14 +263,19 @@ enum TranscribeCommand {
                         modelVersion = .v3
                     case "tdt-ctc-110m", "110m":
                         modelVersion = .tdtCtc110m
+                    case "fluid-mini", "mini":
+                        modelVersion = .fluidParakeetMini
+                    case "fluid-pico", "pico":
+                        modelVersion = .fluidParakeetPico
                     default:
                         logger.error(
-                            "Invalid model version: \(arguments[i + 1]). Use 'v2', 'v3', or 'tdt-ctc-110m'")
+                            "Invalid model version: \(arguments[i + 1]). Use 'v2', 'v3', 'tdt-ctc-110m', 'fluid-mini' or 'fluid-pico'"
+                        )
                         exit(1)
                     }
                     i += 1
                 }
-            case "--model-dir":
+            case "--model-dir", "--model-directory":
                 if i + 1 < arguments.count {
                     modelDir = arguments[i + 1]
                     i += 1
@@ -310,7 +315,8 @@ enum TranscribeCommand {
             )
             await testStreamingTranscription(
                 audioFile: audioFile, showMetadata: showMetadata, wordTimestamps: wordTimestamps,
-                outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath)
+                outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath,
+                modelDir: modelDir)
         } else {
             logger.info("Using batch mode with direct processing\n")
             await testBatchTranscription(
@@ -335,7 +341,7 @@ enum TranscribeCommand {
             let models: AsrModels
             if let modelDir = modelDir {
                 let dir = URL(fileURLWithPath: modelDir)
-                models = try await AsrModels.load(from: dir, version: modelVersion)
+                models = try await AsrModels.loadLocalOnly(from: dir, version: modelVersion)
             } else {
                 models = try await AsrModels.downloadAndLoad(version: modelVersion)
             }
@@ -519,6 +525,8 @@ enum TranscribeCommand {
                 case .v2: modelVersionLabel = "v2"
                 case .v3: modelVersionLabel = "v3"
                 case .tdtCtc110m: modelVersionLabel = "tdt-ctc-110m"
+                case .fluidParakeetMini: modelVersionLabel = "fluid-mini"
+                case .fluidParakeetPico: modelVersionLabel = "fluid-pico"
                 }
                 let output = TranscriptionJSONOutput(
                     audioFile: audioFile,
@@ -608,7 +616,7 @@ enum TranscribeCommand {
     /// Test streaming transcription
     private static func testStreamingTranscription(
         audioFile: String, showMetadata: Bool, wordTimestamps: Bool, outputJsonPath: String?,
-        modelVersion: AsrModelVersion, customVocabPath: String?
+        modelVersion: AsrModelVersion, customVocabPath: String?, modelDir: String?
     ) async {
         // Use optimized streaming configuration
         let config = SlidingWindowAsrConfig.streaming
@@ -618,7 +626,12 @@ enum TranscribeCommand {
 
         do {
             // Initialize ASR models
-            let models = try await AsrModels.downloadAndLoad(version: modelVersion)
+            let models: AsrModels
+            if let modelDir {
+                models = try await AsrModels.loadLocalOnly(from: URL(fileURLWithPath: modelDir), version: modelVersion)
+            } else {
+                models = try await AsrModels.downloadAndLoad(version: modelVersion)
+            }
 
             // Configure vocabulary boosting if custom vocab is provided (Option 3: Hybrid Rescoring)
             if let vocabPath = customVocabPath {
@@ -776,6 +789,8 @@ enum TranscribeCommand {
                 case .v2: modelVersionLabel = "v2"
                 case .v3: modelVersionLabel = "v3"
                 case .tdtCtc110m: modelVersionLabel = "tdt-ctc-110m"
+                case .fluidParakeetMini: modelVersionLabel = "fluid-mini"
+                case .fluidParakeetPico: modelVersionLabel = "fluid-pico"
                 }
                 let output = TranscriptionJSONOutput(
                     audioFile: audioFile,
@@ -959,8 +974,10 @@ enum TranscribeCommand {
                 --metadata         Show confidence, start time, and end time in results
                 --word-timestamps  Show word-level timestamps for each word in the transcription
                 --output-json <file>  Save full transcription result to JSON (includes word timings)
-                --model-version <version>  ASR model version: v2, v3, or tdt-ctc-110m (default: v3)
-                --model-dir <path>     Path to local model directory (skips download)
+                --model-version <version>  ASR model version: v2, v3, tdt-ctc-110m, fluid-mini or fluid-pico (default: v3)
+                --model-dir <path>     Extracted local model folder (required for Mini/Pico; skips download)
+                Mini/Pico packs: https://models.fluidvoice.app/parakeet/fluid-mini/1.0.0/fluid-parakeet-mini-coreml.tar
+                                https://models.fluidvoice.app/parakeet/fluid-pico/1.0.0/fluid-parakeet-pico-coreml.tar
                 --custom-vocab <file>  Apply vocabulary boosting using terms from file (batch mode only)
                 --parakeet-variant <variant>  Use any Parakeet model via StreamingAsrEngine protocol
 

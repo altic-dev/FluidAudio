@@ -16,6 +16,7 @@ public actor AsrManager {
 
     internal var preprocessorModel: MLModel?
     internal var encoderModel: MLModel?
+    internal var splitEncoder: ParakeetSplitEncoder?
     internal var decoderModel: MLModel?
     internal var jointModel: MLModel?
     internal var preparedParakeetPreprocessorOutputs: [UUID: ParakeetPreprocessorOutput] = [:]
@@ -105,7 +106,7 @@ public actor AsrManager {
 
         if asrModels?.usesSplitFrontend == true {
             // Split frontend: need both preprocessor and encoder
-            return preprocessorModel != nil && encoderModel != nil
+            return preprocessorModel != nil && (encoderModel != nil || splitEncoder != nil)
         } else {
             // Fused frontend: preprocessor contains encoder
             return preprocessorModel != nil
@@ -120,6 +121,7 @@ public actor AsrManager {
         self.asrModels = models
         self.preprocessorModel = models.preprocessor
         self.encoderModel = models.encoder
+        self.splitEncoder = models.splitEncoder
         self.decoderModel = models.decoder
         self.jointModel = models.joint
         self.vocabulary = models.vocabulary
@@ -323,6 +325,7 @@ public actor AsrManager {
         asrModels = nil
         preprocessorModel = nil
         encoderModel = nil
+        splitEncoder = nil
         decoderModel = nil
         jointModel = nil
         preparedParakeetPreprocessorOutputs.removeAll()
@@ -380,7 +383,7 @@ public actor AsrManager {
                 isLastChunk: isLastChunk,
                 globalFrameOffset: globalFrameOffset
             )
-        case .v3:
+        case .v3, .fluidParakeetMini, .fluidParakeetPico:
             let decoder = TdtDecoderV3(config: adaptedConfig)
             return try await decoder.decodeWithTimings(
                 encoderOutput: encoderOutput,

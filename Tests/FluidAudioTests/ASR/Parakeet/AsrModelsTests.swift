@@ -349,6 +349,294 @@ final class AsrModelsTests: XCTestCase {
         XCTAssertEqual(AsrModelVersion.tdtCtc110m.repo, .parakeetTdtCtc110m)
         XCTAssertEqual(AsrModelVersion.v2.repo, .parakeetV2)
         XCTAssertEqual(AsrModelVersion.v3.repo, .parakeet)
+        XCTAssertEqual(AsrModelVersion.fluidParakeetMini.repo, .fluidParakeetMini)
+        XCTAssertEqual(AsrModelVersion.fluidParakeetPico.repo, .fluidParakeetPico)
+    }
+
+    func testFluidParakeetVersionsKeepV3Contract() {
+        for version in [AsrModelVersion.fluidParakeetMini, .fluidParakeetPico] {
+            XCTAssertEqual(version.blankId, AsrModelVersion.v3.blankId)
+            XCTAssertEqual(version.decoderLayers, AsrModelVersion.v3.decoderLayers)
+            XCTAssertEqual(version.encoderHiddenSize, AsrModelVersion.v3.encoderHiddenSize)
+            XCTAssertFalse(version.hasFusedEncoder)
+            XCTAssertEqual(
+                ModelNames.getRequiredModelNames(for: version.repo, variant: nil), ModelNames.ASR.requiredModels)
+            XCTAssertEqual(
+                AsrModels.defaultCacheDirectory(for: version).lastPathComponent, version.repo.folderName)
+        }
+        XCTAssertEqual(Repo.fluidParakeetMini.folderName, "fluid-parakeet-mini-coreml")
+        XCTAssertEqual(Repo.fluidParakeetPico.remotePath, "altic-dev/fluid-parakeet-pico-coreml")
+    }
+
+    func testEveryVersionHasAnIsolatedCacheAndLegacyDefaultsStayV3() {
+        let paths = AsrModelVersion.allCases.map { AsrModels.defaultCacheDirectory(for: $0).path }
+        XCTAssertEqual(Set(paths).count, AsrModelVersion.allCases.count)
+        XCTAssertEqual(AsrModels.defaultCacheDirectory(), AsrModels.defaultCacheDirectory(for: .v3))
+        XCTAssertEqual(AsrModelVersion.v2.repo.remotePath, "FluidInference/parakeet-tdt-0.6b-v2-coreml")
+        XCTAssertEqual(AsrModelVersion.v3.repo.remotePath, "FluidInference/parakeet-tdt-0.6b-v3-coreml")
+        XCTAssertEqual(AsrModelVersion.tdtCtc110m.repo.folderName, "parakeet-tdt-ctc-110m")
+    }
+
+    func testFolderInferenceUsesNearestExactComponent() {
+        for version in AsrModelVersion.allCases {
+            let folder = URL(fileURLWithPath: "/local/models/\(version.repo.folderName)")
+            XCTAssertEqual(AsrModels.inferredVersion(from: folder), version)
+        }
+        let nested = URL(fileURLWithPath: "/\(Repo.fluidParakeetMini.folderName)/\(Repo.parakeet.folderName)")
+        XCTAssertEqual(AsrModels.inferredVersion(from: nested), .v3)
+        XCTAssertNil(
+            AsrModels.inferredVersion(from: URL(fileURLWithPath: "/models/\(Repo.fluidParakeetMini.folderName)-backup"))
+        )
+        XCTAssertNil(AsrModels.inferredVersion(from: URL(fileURLWithPath: "/models/renamed-local-model")))
+    }
+
+    func testLocalOnlyMissingFilesUseExactCustomFolderWithoutRepairingSiblingCache() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "FluidParakeetLocal-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let custom = root.appendingPathComponent("renamed-model")
+        let sibling = root.appendingPathComponent(Repo.fluidParakeetMini.folderName)
+        try FileManager.default.createDirectory(at: custom, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        let marker = sibling.appendingPathComponent("preserve-me.txt")
+        try Data("existing unrelated cache".utf8).write(to: marker)
+        do {
+            _ = try await AsrModels.loadLocalOnly(from: custom, version: .fluidParakeetMini)
+            XCTFail("Missing installed model files must fail without downloading.")
+        } catch AsrModelsError.modelNotFound(let name, let path) {
+            XCTAssertEqual(name, ModelNames.ASR.preprocessorFile)
+            XCTAssertEqual(path, custom.appendingPathComponent(name))
+        }
+        XCTAssertEqual(try Data(contentsOf: marker), Data("existing unrelated cache".utf8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: custom.path), [])
+    }
+
+    func testCancelledLocalOnlyLoadHasNoFilesystemEffects() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "FluidParakeetCancelled-\(UUID().uuidString)")
+        let gate = AsyncStream<Void>.makeStream()
+        let operation = Task {
+            for await _ in gate.stream { break }
+            return try await AsrModels.loadLocalOnly(from: folder, version: .fluidParakeetPico)
+        }
+        operation.cancel()
+        gate.continuation.yield(())
+        gate.continuation.finish()
+        do {
+            _ = try await operation.value
+            XCTFail("Cancelled local-only loading must not start model work.")
+        } catch is CancellationError {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    func testCancelledForceDownloadCannotDeleteExistingFolder() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "FluidParakeetForce-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let marker = folder.appendingPathComponent("preserve-me.txt")
+        try Data("keep existing files".utf8).write(to: marker)
+        let gate = AsyncStream<Void>.makeStream()
+        let operation = Task {
+            for await _ in gate.stream { break }
+            return try await AsrModels.download(to: folder, force: true, version: .fluidParakeetMini)
+        }
+        operation.cancel()
+        gate.continuation.yield(())
+        gate.continuation.finish()
+        do {
+            _ = try await operation.value
+            XCTFail("Cancelled forced download must not delete installed files.")
+        } catch is CancellationError {}
+        XCTAssertEqual(try Data(contentsOf: marker), Data("keep existing files".utf8))
+    }
+
+    func testFluidParakeetDownloadsRequireLocalPacksAndPreserveFiles() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let marker = folder.appendingPathComponent("existing-settings.txt")
+        try Data("unchanged".utf8).write(to: marker)
+        for version in [AsrModelVersion.fluidParakeetMini, .fluidParakeetPico] {
+            XCTAssertTrue(version.requiresLocalModels)
+            XCTAssertEqual(version.hostedModelArchiveURL?.host, "models.fluidvoice.app")
+            do {
+                _ = try await AsrModels.download(to: folder, force: true, version: version)
+                XCTFail("A local-only variant must not contact private HF or delete existing files")
+            } catch let error as AsrModelsError {
+                XCTAssertTrue(error.localizedDescription.contains("models.fluidvoice.app"))
+                XCTAssertTrue(error.localizedDescription.contains("--model-dir"))
+            }
+            XCTAssertEqual(try Data(contentsOf: marker), Data("unchanged".utf8))
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [marker.lastPathComponent])
+            let valid = try await AsrModels.isModelValid(version: version, at: folder)
+            XCTAssertFalse(valid)
+        }
+        for version in [AsrModelVersion.v2, .v3, .tdtCtc110m] {
+            XCTAssertFalse(version.requiresLocalModels)
+            XCTAssertNil(version.hostedModelArchiveURL)
+        }
+    }
+
+    /// Opt-in integration proof uses installed real models and recorded speech, never fixtures.
+    func testFluidParakeetRealModelsTranscribeRecordedSpeech() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let mini = environment["FLUIDAUDIO_MINI_MODEL_DIR"],
+            let pico = environment["FLUIDAUDIO_PICO_MODEL_DIR"],
+            let recording = environment["FLUIDAUDIO_PARAKEET_TEST_AUDIO"]
+        else { throw XCTSkip("Provide Mini/Pico compiled models and recorded speech for local inference proof.") }
+        for (directory, version) in [(mini, AsrModelVersion.fluidParakeetMini), (pico, .fluidParakeetPico)] {
+            let models = try await AsrModels.loadLocalOnly(from: URL(fileURLWithPath: directory), version: version)
+            XCTAssertEqual(models.version, version)
+            XCTAssertEqual(models.vocabulary.count, 8192)
+            XCTAssertTrue(models.encoder != nil || models.splitEncoder != nil)
+            XCTAssertEqual(models.encoderOutputShape, [1, 1024, 188])
+            XCTAssertEqual(Set(models.encoderInputFeatureNames), ["mel", "mel_length"])
+            XCTAssertTrue(AsrModels.localModelsExist(at: URL(fileURLWithPath: directory), version: version))
+            let retainedDirectory = try await AsrModels.download(to: URL(fileURLWithPath: directory), version: version)
+            XCTAssertEqual(retainedDirectory, URL(fileURLWithPath: directory))
+            let valid = try await AsrModels.isModelValid(version: version, at: URL(fileURLWithPath: directory))
+            XCTAssertTrue(valid)
+            let manager = AsrManager(
+                config: ASRConfig(
+                    tdtConfig: TdtConfig(blankId: version.blankId), encoderHiddenSize: version.encoderHiddenSize))
+            try await manager.initialize(models: models)
+            let result = try await manager.transcribe(URL(fileURLWithPath: recording))
+            XCTAssertFalse(result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            XCTAssertGreaterThan(result.duration, 0)
+            XCTAssertTrue(result.processingTime.isFinite)
+            print("Fluid Parakeet \(version.repo.folderName) recorded-speech result: \(result.text)")
+            let recorded = try AudioConverter().resampleAudioFile(URL(fileURLWithPath: recording))
+            let samples = Array(recorded.prefix(ASRConstants.maxModelSamples))
+            let embedding = try await manager.pronunciationEmbedding(
+                audioSamples: samples, focalSampleRange: 0..<samples.count)
+            XCTAssertEqual(embedding.values.count, 1024)
+            XCTAssertTrue(embedding.values.allSatisfy(\.isFinite))
+            XCTAssertGreaterThan(embedding.sourceFrameCount, 0)
+            print("Fluid Parakeet \(version.repo.folderName) pronunciation dimensions: \(embedding.values.count)")
+            try await self.verifyRetainedEncoderWindow(manager: manager, samples: samples)
+            try await self.verifySharedEncoderWindows(models: models, samples: samples)
+            await manager.cleanup()
+        }
+    }
+
+    /// Explicit opt-in permits downloading the real auxiliary CTC110m model through the library API.
+    func testFluidParakeetRealModelsSupportCtc110mVocabularyBoosting() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["FLUIDAUDIO_TEST_CTC_DOWNLOAD"] == "1",
+            let mini = environment["FLUIDAUDIO_MINI_MODEL_DIR"],
+            let pico = environment["FLUIDAUDIO_PICO_MODEL_DIR"],
+            let recording = environment["FLUIDAUDIO_PARAKEET_TEST_AUDIO"]
+        else { throw XCTSkip("Explicitly opt in to real CTC110m downloading and recorded-speech boosting.") }
+        let ctc = try await CtcModels.downloadAndLoad(variant: .ctc110m)
+        let tokenizer = try await CtcTokenizer.load(from: CtcModels.defaultCacheDirectory(for: .ctc110m))
+        let ids = tokenizer.encode("phone")
+        XCTAssertFalse(ids.isEmpty)
+        let vocabulary = CustomVocabularyContext(terms: [
+            CustomVocabularyTerm(text: "phone", weight: 10, tokenIds: nil, ctcTokenIds: ids)
+        ])
+        for (directory, version) in [(mini, AsrModelVersion.fluidParakeetMini), (pico, .fluidParakeetPico)] {
+            let models = try await AsrModels.loadLocalOnly(from: URL(fileURLWithPath: directory), version: version)
+            XCTAssertEqual(models.vocabulary.count, 8192)
+            XCTAssertEqual(version.blankId, 8192)
+            let manager = AsrManager(config: ASRConfig(tdtConfig: TdtConfig(blankId: version.blankId)))
+            try await manager.initialize(models: models)
+            try await manager.configureVocabularyBoosting(vocabulary: vocabulary, ctcModels: ctc)
+            let result = try await manager.transcribe(URL(fileURLWithPath: recording))
+            XCTAssertTrue(result.text.lowercased().contains("phone"))
+            XCTAssertTrue(result.processingTime.isFinite)
+            print("Fluid Parakeet \(version.repo.folderName) CTC110m-boosted result: \(result.text)")
+            await manager.disableVocabularyBoosting()
+            let unboosted = try await manager.transcribe(URL(fileURLWithPath: recording))
+            XCTAssertFalse(unboosted.text.isEmpty)
+            await manager.cleanup()
+        }
+    }
+
+    func testRealMonolithicLegacyVersionsStillTranscribeRecordedSpeech() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let v2 = environment["FLUIDAUDIO_V2_MODEL_DIR"],
+            let v3 = environment["FLUIDAUDIO_V3_MODEL_DIR"],
+            let recording = environment["FLUIDAUDIO_PARAKEET_TEST_AUDIO"]
+        else {
+            throw XCTSkip("Provide existing v2/v3 compiled models and recorded speech for legacy regression proof.")
+        }
+        for (directory, version) in [(v2, AsrModelVersion.v2), (v3, .v3)] {
+            let models = try await AsrModels.loadLocalOnly(from: URL(fileURLWithPath: directory), version: version)
+            XCTAssertNotNil(models.encoder)
+            XCTAssertNil(models.splitEncoder)
+            let manager = AsrManager(
+                config: ASRConfig(
+                    tdtConfig: TdtConfig(blankId: version.blankId), encoderHiddenSize: version.encoderHiddenSize))
+            try await manager.initialize(models: models)
+            let result = try await manager.transcribe(URL(fileURLWithPath: recording))
+            XCTAssertFalse(result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            let available = await manager.isAvailable
+            XCTAssertTrue(available)
+            print("Legacy \(version.repo.folderName) recorded-speech result: \(result.text)")
+            await manager.cleanup()
+        }
+    }
+
+    private func verifySharedEncoderWindows(models: AsrModels, samples: [Float]) async throws {
+        let config = ASRConfig(tdtConfig: TdtConfig(blankId: models.version.blankId), encoderHiddenSize: 1024)
+        let firstManager = AsrManager(config: config)
+        let secondManager = AsrManager(config: config)
+        try await firstManager.initialize(models: models)
+        try await secondManager.initialize(models: models)
+        let suffix = Array(samples.suffix(max(16000, samples.count / 2)))
+        let inputA = firstManager.padAudioIfNeeded(samples, targetLength: ASRConstants.maxModelSamples)
+        let inputB = secondManager.padAudioIfNeeded(suffix, targetLength: ASRConstants.maxModelSamples)
+        let preprocessorA = try await firstManager.prepareParakeetPreprocessorOutput(
+            inputA, originalLength: samples.count, snapshotOutput: true)
+        let preprocessorB = try await secondManager.prepareParakeetPreprocessorOutput(
+            inputB, originalLength: suffix.count, snapshotOutput: true)
+        async let requestA = firstManager.prepareParakeetEncoderOutput(
+            preparedPreprocessor: preprocessorA, snapshotOutput: true)
+        async let requestB = secondManager.prepareParakeetEncoderOutput(
+            preparedPreprocessor: preprocessorB, snapshotOutput: true)
+        let (windowA, windowB) = try await (requestA, requestB)
+        let frames = ASRConstants.calculateEncoderFrames(from: samples.count)
+        let before = try await firstManager.pronunciationFeatures(
+            preparedEncoder: windowA, actualAudioFrames: frames, contextFrameAdjustment: 0, globalFrameOffset: 0)
+        let held = try XCTUnwrap(before)
+        let laterPreprocessor = try await secondManager.prepareParakeetPreprocessorOutput(
+            inputB, originalLength: suffix.count, snapshotOutput: true)
+        let laterWindow = try await secondManager.prepareParakeetEncoderOutput(
+            preparedPreprocessor: laterPreprocessor, snapshotOutput: true)
+        let after = try await firstManager.pronunciationFeatures(
+            preparedEncoder: windowA, actualAudioFrames: frames, contextFrameAdjustment: 0, globalFrameOffset: 0)
+        XCTAssertEqual(try XCTUnwrap(after).values, held.values)
+        XCTAssertTrue(held.values.allSatisfy(\.isFinite))
+        await firstManager.discardParakeetEncoderOutput(windowA)
+        await secondManager.discardParakeetEncoderOutput(windowB)
+        await secondManager.discardParakeetEncoderOutput(laterWindow)
+        await firstManager.cleanup()
+        await secondManager.cleanup()
+    }
+
+    private func verifyRetainedEncoderWindow(manager: AsrManager, samples: [Float]) async throws {
+        let firstInput = manager.padAudioIfNeeded(samples, targetLength: ASRConstants.maxModelSamples)
+        let firstPreprocessor = try await manager.prepareParakeetPreprocessorOutput(
+            firstInput, originalLength: samples.count, snapshotOutput: true)
+        let firstEncoder = try await manager.prepareParakeetEncoderOutput(
+            preparedPreprocessor: firstPreprocessor, snapshotOutput: true)
+        let frames = ASRConstants.calculateEncoderFrames(from: samples.count)
+        let first = try await manager.pronunciationFeatures(
+            preparedEncoder: firstEncoder, actualAudioFrames: frames, contextFrameAdjustment: 0, globalFrameOffset: 0)
+        let before = try XCTUnwrap(first)
+        let laterSamples = Array(samples.suffix(max(16000, samples.count / 2)))
+        let laterInput = manager.padAudioIfNeeded(laterSamples, targetLength: ASRConstants.maxModelSamples)
+        let laterPreprocessor = try await manager.prepareParakeetPreprocessorOutput(
+            laterInput, originalLength: laterSamples.count, snapshotOutput: true)
+        let laterEncoder = try await manager.prepareParakeetEncoderOutput(
+            preparedPreprocessor: laterPreprocessor, snapshotOutput: true)
+        let retained = try await manager.pronunciationFeatures(
+            preparedEncoder: firstEncoder, actualAudioFrames: frames, contextFrameAdjustment: 0, globalFrameOffset: 0)
+        XCTAssertEqual(try XCTUnwrap(retained).values, before.values)
+        XCTAssertEqual(before.hiddenSize, 1024)
+        await manager.discardParakeetEncoderOutput(laterEncoder)
+        await manager.discardParakeetEncoderOutput(firstEncoder)
     }
 
     func testTdtCtc110mUsesSplitFrontend() {
@@ -394,7 +682,7 @@ final class AsrModelsTests: XCTestCase {
     }
 
     func testAllModelVersionsHaveRequiredProperties() {
-        let versions: [AsrModelVersion] = [.v2, .v3, .tdtCtc110m]
+        let versions = AsrModelVersion.allCases
 
         for version in versions {
             // All versions should have valid repo

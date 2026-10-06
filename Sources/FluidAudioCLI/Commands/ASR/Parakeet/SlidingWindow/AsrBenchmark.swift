@@ -757,6 +757,7 @@ extension ASRBenchmark {
         var streamingChunkDuration = 10.0
         var useStreamingEou = false
         var modelVersion: AsrModelVersion = .v3  // Default to v3
+        var modelDir: String?
 
         // Check for help flag first
         if arguments.contains("--help") || arguments.contains("-h") {
@@ -807,6 +808,11 @@ extension ASRBenchmark {
                     }
                     i += 1
                 }
+            case "--model-dir", "--model-directory":
+                if i + 1 < arguments.count {
+                    modelDir = arguments[i + 1]
+                    i += 1
+                }
             case "--model-version":
                 if i + 1 < arguments.count {
                     let versionString = arguments[i + 1].lowercased()
@@ -817,9 +823,14 @@ extension ASRBenchmark {
                         modelVersion = .v3
                     case "tdt-ctc-110m", "110m":
                         modelVersion = .tdtCtc110m
+                    case "fluid-mini", "mini":
+                        modelVersion = .fluidParakeetMini
+                    case "fluid-pico", "pico":
+                        modelVersion = .fluidParakeetPico
                     default:
                         logger.error(
-                            "Invalid model version: \(arguments[i + 1]). Use 'v2', 'v3', or 'tdt-ctc-110m'")
+                            "Invalid model version: \(arguments[i + 1]). Use 'v2', 'v3', 'tdt-ctc-110m', 'fluid-mini' or 'fluid-pico'"
+                        )
                         exit(1)
                     }
                     i += 1
@@ -842,6 +853,8 @@ extension ASRBenchmark {
         case .v2: versionLabel = "v2"
         case .v3: versionLabel = "v3"
         case .tdtCtc110m: versionLabel = "tdt-ctc-110m"
+        case .fluidParakeetMini: versionLabel = "fluid-mini"
+        case .fluidParakeetPico: versionLabel = "fluid-pico"
         }
         logger.info("   Model version: \(versionLabel)")
         logger.info("   Debug mode: \(debugMode ? "enabled" : "disabled")")
@@ -912,7 +925,13 @@ extension ASRBenchmark {
 
             logger.info("Initializing ASR system...")
             do {
-                let models = try await AsrModels.downloadAndLoad(version: modelVersion)
+                let models: AsrModels
+                if let modelDir {
+                    models = try await AsrModels.loadLocalOnly(
+                        from: URL(fileURLWithPath: modelDir), version: modelVersion)
+                } else {
+                    models = try await AsrModels.downloadAndLoad(version: modelVersion)
+                }
                 try await asrManager.initialize(models: models)
                 logger.info("ASR system initialized successfully")
 
@@ -1134,7 +1153,10 @@ extension ASRBenchmark {
                 --max-files <number>      Maximum number of files to process (default: all)
                 --single-file <id>        Process only a specific file (e.g., 1089-134686-0011)
                 --output <file>           Output JSON file path (default: asr_benchmark_results.json)
-                --model-version <version> ASR model version to use: v2, v3, or tdt-ctc-110m (default: v3)
+                --model-version <version> ASR model version to use: v2, v3, tdt-ctc-110m, fluid-mini or fluid-pico (default: v3)
+                --model-dir <path>      Extracted local model folder (required for Mini/Pico)
+                Mini/Pico packs: https://models.fluidvoice.app/parakeet/fluid-mini/1.0.0/fluid-parakeet-mini-coreml.tar
+                                https://models.fluidvoice.app/parakeet/fluid-pico/1.0.0/fluid-parakeet-pico-coreml.tar
                 --debug                   Enable debug logging
                 --auto-download           Automatically download LibriSpeech dataset (default)
                 --no-auto-download        Disable automatic dataset download

@@ -3,17 +3,42 @@ import Foundation
 import OSLog
 
 /// ASR model version enum
-public enum AsrModelVersion: Sendable {
+public enum AsrModelVersion: CaseIterable, Sendable {
     case v2
     case v3
     /// 110M parameter hybrid TDT-CTC model with fused preprocessor+encoder
     case tdtCtc110m
+    /// Fluid Parakeet Mini: v3 compressed with quantization-aware training (English). Same tokenizer,
+    /// window and decoder/joint contract as v3.
+    case fluidParakeetMini
+    /// Fluid Parakeet Pico: the smallest compressed v3 (English). Same contract as v3.
+    case fluidParakeetPico
 
-    var repo: Repo {
+    /// Repository descriptor and isolated cache folder associated with this version.
+    public var repo: Repo {
         switch self {
         case .v2: return .parakeetV2
         case .v3: return .parakeet
         case .tdtCtc110m: return .parakeetTdtCtc110m
+        case .fluidParakeetMini: return .fluidParakeetMini
+        case .fluidParakeetPico: return .fluidParakeetPico
+        }
+    }
+
+    /// Mini/Pico use extracted hosted model packs; their repository descriptors identify caches,
+    /// not a public Hugging Face download. All existing versions retain automatic downloads.
+    public var requiresLocalModels: Bool {
+        self == .fluidParakeetMini || self == .fluidParakeetPico
+    }
+
+    /// Verified hosted artifact location for manually installing Mini/Pico model packs.
+    public var hostedModelArchiveURL: URL? {
+        switch self {
+        case .fluidParakeetMini:
+            return URL(string: "https://models.fluidvoice.app/parakeet/fluid-mini/1.0.0/fluid-parakeet-mini-coreml.tar")
+        case .fluidParakeetPico:
+            return URL(string: "https://models.fluidvoice.app/parakeet/fluid-pico/1.0.0/fluid-parakeet-pico-coreml.tar")
+        default: return nil
         }
     }
 
@@ -37,7 +62,7 @@ public enum AsrModelVersion: Sendable {
     public var blankId: Int {
         switch self {
         case .v2, .tdtCtc110m: return 1024
-        case .v3: return 8192
+        case .v3, .fluidParakeetMini, .fluidParakeetPico: return 8192
         }
     }
 
@@ -55,7 +80,7 @@ public struct AsrModels: Sendable {
     /// Required model names for ASR
     public static let requiredModelNames = ModelNames.ASR.requiredModels
 
-    /// Separate encoder model (nil for fused models like tdtCtc110m where preprocessor includes encoder)
+    /// Monolithic encoder (nil for a split encoder or fused tdtCtc110m frontend).
     public let encoder: MLModel?
     public let preprocessor: MLModel
     public let decoder: MLModel
@@ -63,6 +88,10 @@ public struct AsrModels: Sendable {
     public let configuration: MLModelConfiguration
     public let vocabulary: [Int: String]
     public let version: AsrModelVersion
+    public let splitEncoder: ParakeetSplitEncoder?
+    /// Immutable input/output descriptors for either encoder implementation.
+    public let encoderInputFeatureNames: [String]
+    public let encoderOutputShape: [Int]
 
     private static let logger = AppLogger(category: "AsrModels")
 
@@ -73,7 +102,8 @@ public struct AsrModels: Sendable {
         joint: MLModel,
         configuration: MLModelConfiguration,
         vocabulary: [Int: String],
-        version: AsrModelVersion
+        version: AsrModelVersion,
+        splitEncoder: ParakeetSplitEncoder? = nil
     ) {
         self.encoder = encoder
         self.preprocessor = preprocessor
@@ -82,6 +112,67 @@ public struct AsrModels: Sendable {
         self.configuration = configuration
         self.vocabulary = vocabulary
         self.version = version
+        self.splitEncoder = splitEncoder
+        self.encoderInputFeatureNames =
+            splitEncoder?.inputFeatureNames
+            ?? encoder?.modelDescription.inputDescriptionsByName.keys.sorted() ?? []
+        self.encoderOutputShape =
+            splitEncoder?.outputShape
+            ?? encoder?.modelDescription.outputDescriptionsByName["encoder"]?.multiArrayConstraint?.shape.map(
+                \.intValue) ?? []
+    }
+
+    /// Shared encoder inference for dictation and pronunciation, with no model-subclass async override.
+    /// Split outputs own their array storage before leaving actor isolation, including shared-model callers.
+    public func predictEncoder(
+        from input: MLFeatureProvider, options: MLPredictionOptions
+    ) async throws -> MLFeatureProvider {
+        try Task.checkCancellation()
+        if let splitEncoder { return try await splitEncoder.prediction(from: input, options: options) }
+        guard let encoder else { throw AsrModelsError.loadingFailed("Separate encoder unavailable") }
+        let output = try await encoder.compatPrediction(from: input, options: options)
+        try Task.checkCancellation()
+        return output
+    }
+
+    static func snapshotFeatureProvider(
+        _ provider: MLFeatureProvider
+    ) throws -> MLFeatureProvider {
+        var features: [String: MLFeatureValue] = [:]
+        for name in provider.featureNames {
+            guard let value = provider.featureValue(for: name) else { continue }
+            if let array = value.multiArrayValue {
+                features[name] = MLFeatureValue(multiArray: try snapshotMultiArray(array))
+            } else {
+                features[name] = value
+            }
+        }
+        return try MLDictionaryFeatureProvider(dictionary: features)
+    }
+
+    private static func snapshotMultiArray(_ source: MLMultiArray) throws -> MLMultiArray {
+        let storageElementCount = zip(source.shape, source.strides).reduce(1) { extent, pair in
+            let (dimension, stride) = pair
+            return extent + max(0, dimension.intValue - 1) * stride.intValue
+        }
+        let byteCount = storageElementCount * ANEMemoryUtils.getElementSize(for: source.dataType)
+        let storage = UnsafeMutableRawPointer.allocate(byteCount: max(byteCount, 1), alignment: 64)
+        if byteCount > 0 {
+            memcpy(storage, source.dataPointer, byteCount)
+        }
+
+        do {
+            return try MLMultiArray(
+                dataPointer: storage,
+                shape: source.shape,
+                dataType: source.dataType,
+                strides: source.strides,
+                deallocator: { pointer in pointer.deallocate() }
+            )
+        } catch {
+            storage.deallocate()
+            throw error
+        }
     }
 
     /// Whether this model uses a separate preprocessor and encoder (true for 0.6B, false for 110m fused)
@@ -121,12 +212,13 @@ extension AsrModels {
             .appendingPathComponent(version.repo.folderName)
     }
 
-    private static func inferredVersion(from directory: URL) -> AsrModelVersion? {
-        let directoryPath = directory.path.lowercased()
-        let knownVersions: [AsrModelVersion] = [.tdtCtc110m, .v2, .v3]
-
-        for version in knownVersions {
-            if directoryPath.contains(version.repo.folderName.lowercased()) {
+    /// Infer a version from the nearest canonical repository folder in a local URL.
+    /// Renamed model folders need an explicit version; substring matches are not identities.
+    public static func inferredVersion(from directory: URL) -> AsrModelVersion? {
+        for component in directory.pathComponents.reversed() {
+            if let version = AsrModelVersion.allCases.first(where: {
+                component.lowercased() == $0.repo.folderName.lowercased()
+            }) {
                 return version
             }
         }
@@ -157,6 +249,13 @@ extension AsrModels {
         version: AsrModelVersion = .v3,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> AsrModels {
+        try Task.checkCancellation()
+        if version.requiresLocalModels {
+            return try await loadLocalOnly(from: directory, version: version, configuration: configuration)
+        }
+        if !version.hasFusedEncoder, try ParakeetSplitEncoder.pieceURLs(in: directory) != nil {
+            return try await loadLocalOnly(from: directory, version: version, configuration: configuration)
+        }
         logger.info("Loading ASR models from: \(directory.path)")
 
         let config = configuration ?? defaultConfiguration()
@@ -168,6 +267,7 @@ extension AsrModels {
         var loadedModels: [String: MLModel] = [:]
 
         for spec in specs {
+            try Task.checkCancellation()
             let models = try await DownloadUtils.loadModels(
                 version.repo,
                 modelNames: [spec.fileName],
@@ -193,6 +293,7 @@ extension AsrModels {
         }
 
         // Load decoder and joint as well
+        try Task.checkCancellation()
         let decoderAndJoint = try await DownloadUtils.loadModels(
             version.repo,
             modelNames: [Names.decoderFile, Names.jointFile],
@@ -206,6 +307,8 @@ extension AsrModels {
         else {
             throw AsrModelsError.loadingFailed("Failed to load decoder or joint model")
         }
+
+        try Task.checkCancellation()
 
         let asrModels = AsrModels(
             encoder: encoderModel,
@@ -223,15 +326,19 @@ extension AsrModels {
     /// Load installed compiled models without downloading, deleting, or repairing model files.
     /// Optional background work should use this entry point and defer recovery to explicit model setup.
     public static func loadLocalOnly(
-        from directory: URL, version: AsrModelVersion = .v3
+        from directory: URL, version: AsrModelVersion = .v3,
+        configuration: MLModelConfiguration? = nil
     ) async throws -> AsrModels {
         try Task.checkCancellation()
         guard directory.isFileURL else {
             throw AsrModelsError.loadingFailed("Local model loading requires a file URL")
         }
-        let configuration = defaultConfiguration()
+        let configuration = configuration ?? defaultConfiguration()
         let specs = createModelSpecs(using: configuration, version: version)
-        let names = specs.map(\.fileName) + [Names.decoderFile, Names.jointFile, Names.vocabulary(for: version.repo)]
+        let pieceURLs = version.hasFusedEncoder ? nil : try ParakeetSplitEncoder.pieceURLs(in: directory)
+        let localSpecs = pieceURLs == nil ? specs : specs.filter { $0.fileName != Names.encoderFile }
+        let names =
+            localSpecs.map(\.fileName) + [Names.decoderFile, Names.jointFile, Names.vocabulary(for: version.repo)]
         for name in names {
             let path = directory.appendingPathComponent(name)
             guard FileManager.default.fileExists(atPath: path.path) else {
@@ -240,12 +347,19 @@ extension AsrModels {
         }
         let vocabulary = try loadVocabulary(from: directory, version: version, resolvingRepositoryDirectory: false)
         var loaded: [String: MLModel] = [:]
-        for spec in specs {
+        for spec in localSpecs {
             try Task.checkCancellation()
-            let config = defaultConfiguration()
+            let config = configuration.copy() as? MLModelConfiguration ?? defaultConfiguration()
             config.computeUnits = spec.computeUnits
             loaded[spec.fileName] = try await MLModel.load(
                 contentsOf: directory.appendingPathComponent(spec.fileName), configuration: config)
+        }
+        let splitEncoder: ParakeetSplitEncoder?
+        if let pieceURLs {
+            splitEncoder = try await ParakeetSplitEncoder.load(
+                urls: pieceURLs, configuration: configuration, hiddenSize: version.encoderHiddenSize)
+        } else {
+            splitEncoder = nil
         }
         try Task.checkCancellation()
         let decoder = try await MLModel.load(
@@ -259,7 +373,7 @@ extension AsrModels {
         }
         return AsrModels(
             encoder: loaded[Names.encoderFile], preprocessor: preprocessor, decoder: decoder, joint: joint,
-            configuration: configuration, vocabulary: vocabulary, version: version)
+            configuration: configuration, vocabulary: vocabulary, version: version, splitEncoder: splitEncoder)
     }
 
     private static func loadVocabulary(
@@ -405,7 +519,16 @@ extension AsrModels {
         version: AsrModelVersion = .v3,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> URL {
+        try Task.checkCancellation()
         let targetDir = directory ?? defaultCacheDirectory(for: version)
+        if version.requiresLocalModels {
+            if !force && localModelsExist(at: targetDir, version: version) { return targetDir }
+            let archive = version.hostedModelArchiveURL?.absoluteString ?? "the FluidVoice hosted model pack"
+            throw AsrModelsError.downloadFailed(
+                "Mini/Pico require installed local models. Download and extract \(archive), then use "
+                    + "loadLocalOnly(from:version:) or CLI --model-dir <extracted-folder>. Existing files were preserved."
+            )
+        }
         logger.info("Downloading ASR models to: \(targetDir.path)")
         let parentDir = targetDir.deletingLastPathComponent()
 
@@ -447,6 +570,7 @@ extension AsrModels {
         }
 
         for spec in specs {
+            try Task.checkCancellation()
             _ = try await DownloadUtils.loadModels(
                 version.repo,
                 modelNames: [spec.fileName],
@@ -456,6 +580,7 @@ extension AsrModels {
             )
         }
 
+        try Task.checkCancellation()
         logger.info("Successfully downloaded ASR models")
         return targetDir
     }
@@ -478,37 +603,52 @@ extension AsrModels {
     }
 
     public static func modelsExist(at directory: URL, version: AsrModelVersion) -> Bool {
-        let fileManager = FileManager.default
-        let requiredFiles =
-            version.hasFusedEncoder ? ModelNames.ASR.requiredModelsFused : ModelNames.ASR.requiredModels
+        return localModelsExist(at: repoPath(from: directory, version: version), version: version)
+    }
 
-        // Check in the DownloadUtils repo structure
-        let repoPath = repoPath(from: directory, version: version)
+    /// Check installed model files in exactly this folder, including a valid contiguous split encoder.
+    /// This performs bounded filesystem reads and never downloads or repairs files.
+    public static func localModelsExist(at directory: URL, version: AsrModelVersion = .v3) -> Bool {
+        guard directory.isFileURL else { return false }
+        let fileManager = FileManager.default
+        var requiredFiles =
+            version.hasFusedEncoder ? ModelNames.ASR.requiredModelsFused : ModelNames.ASR.requiredModels
+        if !version.hasFusedEncoder {
+            do {
+                if let pieces = try ParakeetSplitEncoder.pieceURLs(in: directory) {
+                    requiredFiles.remove(Names.encoderFile)
+                    requiredFiles.formUnion(pieces.map(\.lastPathComponent))
+                }
+            } catch { return false }
+        }
 
         let modelsPresent = requiredFiles.allSatisfy { fileName in
-            let path = repoPath.appendingPathComponent(fileName)
+            let path = directory.appendingPathComponent(fileName)
             return fileManager.fileExists(atPath: path.path)
         }
 
         // Also check for vocabulary file associated with the version
-        let vocabPath = repoPath.appendingPathComponent(Names.vocabulary(for: version.repo))
+        let vocabPath = directory.appendingPathComponent(Names.vocabulary(for: version.repo))
         let vocabPresent = fileManager.fileExists(atPath: vocabPath.path)
 
         return modelsPresent && vocabPresent
     }
 
-    public static func isModelValid(version: AsrModelVersion = .v3) async throws -> Bool {
+    /// CPU-load every installed model, including encoder pieces, without repair or downloads.
+    /// The optional directory addresses an exact extracted pack; omitted uses the version-specific cache.
+    public static func isModelValid(version: AsrModelVersion = .v3, at directory: URL? = nil) async throws -> Bool {
+        try Task.checkCancellation()
         guard SystemInfo.isAppleSilicon else {
             throw ASRError.unsupportedPlatform("Parakeet models require Apple Silicon")
         }
 
-        let cacheDir = defaultCacheDirectory(for: version)
-        guard modelsExist(at: cacheDir, version: version) else {
+        let cacheDir = directory ?? defaultCacheDirectory(for: version)
+        guard localModelsExist(at: cacheDir, version: version) else {
             logger.info("Model validation failed: model files not found")
             return false
         }
 
-        let repoPath = repoPath(from: cacheDir, version: version)
+        let repoPath = cacheDir
         let config = MLModelConfiguration()
         config.computeUnits = .cpuOnly
 
@@ -518,10 +658,15 @@ extension AsrModels {
             ("Joint", ModelNames.ASR.jointFile),
         ]
         if !version.hasFusedEncoder {
-            modelsToValidate.insert(("Encoder", ModelNames.ASR.encoderFile), at: 1)
+            if let pieces = try ParakeetSplitEncoder.pieceURLs(in: repoPath) {
+                modelsToValidate.insert(contentsOf: pieces.map { ($0.lastPathComponent, $0.lastPathComponent) }, at: 1)
+            } else {
+                modelsToValidate.insert(("Encoder", ModelNames.ASR.encoderFile), at: 1)
+            }
         }
 
         for (name, fileName) in modelsToValidate {
+            try Task.checkCancellation()
             let modelPath = repoPath.appendingPathComponent(fileName)
             do {
                 _ = try MLModel(contentsOf: modelPath, configuration: config)
