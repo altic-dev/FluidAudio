@@ -3,11 +3,11 @@ import Foundation
 
 /// Universal protocol for true streaming ASR engines.
 ///
-/// `StreamingEouAsrManager` and `NemotronStreamingAsrManager` conform to this protocol,
+/// `StreamingEouAsrManager`, `NemotronStreamingAsrManager` and `StreamingUnifiedAsrManager` conform,
 /// enabling polymorphic usage through `StreamingAsrEngineFactory`.
 ///
 /// Note: `SlidingWindowAsrManager` (TDT) intentionally does **not** conform — it uses
-/// an offline encoder with overlapping windows, not a cache-aware streaming architecture.
+/// an offline encoder with overlapping windows, rather than a native streaming architecture.
 ///
 /// Usage pattern:
 /// ```swift
@@ -35,7 +35,7 @@ public protocol StreamingAsrEngine: Actor {
 
     /// Process any buffered audio that has accumulated since the last call.
     ///
-    /// For chunk-based engines (EOU, Nemotron), this processes complete chunks
+    /// For chunk-based engines (EOU, Nemotron, Unified), this processes complete chunks
     /// from the internal buffer.
     func processBufferedAudio() async throws
 
