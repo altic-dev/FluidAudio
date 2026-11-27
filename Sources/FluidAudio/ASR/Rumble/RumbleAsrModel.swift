@@ -51,7 +51,7 @@ public final class RumbleAsrModel: @unchecked Sendable {
         public let tokens: [Int]
     }
 
-    public static let fileNames = ["manifest.json", "tokens.bin", "ctc_vocab.bin", "mel_filters.bin"]
+    public static let fileNames = ["rumble.json", "tokens.bin", "ctc_vocab.bin", "mel_filters.bin"]
     public static let modelNames = ["Encoder", "Decoder"]
 
     public let manifest: Manifest
@@ -339,7 +339,7 @@ public final class RumbleAsrModel: @unchecked Sendable {
     }
 
     private static func loadManifest(in directory: URL) throws -> Manifest {
-        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
+        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: directory.appendingPathComponent("rumble.json")))
         guard manifest.sampleRate == 16_000, manifest.block > 0, manifest.capacity > manifest.block, !manifest.eos.isEmpty,
               !manifest.languages.isEmpty, manifest.hidden > 0, manifest.windowMelFrames > 0, manifest.windowAudioFrames > 0
         else { throw Failure.unexpectedLayout("manifest") }
