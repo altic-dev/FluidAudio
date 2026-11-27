@@ -109,24 +109,116 @@ public final class RumbleAsrModel: @unchecked Sendable {
     public func transcribe(samples: [Float], language: String) throws -> Transcript {
         guard let languageTokens = manifest.languages[language] else { throw Failure.unsupportedLanguage(language) }
         guard !samples.isEmpty else { return Transcript(text: "", tokens: []) }
-        let longest = manifest.maxAudioFrames * manifest.hopLength * manifest.windowMelFrames / manifest.windowAudioFrames
-        var results: [Transcript] = []
-        for range in Self.pieces(of: samples, longest: longest, sampleRate: manifest.sampleRate) {
-            let result = try autoreleasepool {
-                try transcribePiece(Array(samples[range]), languageTokens: languageTokens)
-            }
-            results.append(result)
+        let results = try Self.pieces(of: samples, longest: longestPiece, sampleRate: manifest.sampleRate).map { range in
+            var windows: [EncodedWindow] = []
+            return try transcribePiece(Array(samples[range]), languageTokens: languageTokens, cache: &windows)
         }
-        if results.count == 1 { return results[0] }
-        return Transcript(text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: " "), tokens: results.flatMap(\.tokens))
+        return Self.join(results)
     }
 
-    private func transcribePiece(_ input: [Float], languageTokens: [Int]) throws -> Transcript {
-        let started = ProcessInfo.processInfo.systemUptime
-        var samples = input
-        if samples.count < manifest.minimumSamples { samples += [Float](repeating: 0, count: manifest.minimumSamples - samples.count) }
-        let features = mel.compute(samples)
-        let (audio, draft) = try encode(features: features.values, frames: features.frames)
+    public func makeLiveTranscription(language: String) throws -> LiveTranscription {
+        guard let languageTokens = manifest.languages[language] else { throw Failure.unsupportedLanguage(language) }
+        return LiveTranscription(model: self, languageTokens: languageTokens)
+    }
+
+    public struct LiveTranscription {
+        private let model: RumbleAsrModel
+        private let languageTokens: [Int]
+        private var committed: [Transcript] = []
+        private var windows: [EncodedWindow] = []
+        public private(set) var committedSamples = 0
+
+        fileprivate init(model: RumbleAsrModel, languageTokens: [Int]) {
+            self.model = model
+            self.languageTokens = languageTokens
+        }
+
+        public mutating func update(samples: [Float], startingAt offset: Int = 0) throws -> String {
+            try commitCompletedPieces(samples, startingAt: offset)
+            let start = committedSamples - offset
+            let manifest = model.manifest
+            let lookahead = max(0, manifest.fftLength / 2 - manifest.hopLength)
+            let firstCut = model.longestPiece * 2 / 3 + manifest.sampleRate / 20
+            let available = min(samples.count - start, firstCut)
+            let count = max(0, (available - lookahead) / (manifest.windowMelFrames * manifest.hopLength))
+            if count > windows.count {
+                let features = model.mel.compute(Array(samples[start...]))
+                try model.encode(features: features, windowCount: count, cache: &windows)
+            }
+            let draft = model.draft(from: windows)
+            return RumbleAsrModel.join(committed + [Transcript(text: model.decode(draft), tokens: draft)]).text
+        }
+
+        public mutating func finish(samples: [Float]) throws -> Transcript {
+            try commitCompletedPieces(samples, startingAt: 0)
+            guard samples.count > committedSamples else { return RumbleAsrModel.join(committed) }
+            let tail = try model.transcribePiece(
+                Array(samples[committedSamples...]), languageTokens: languageTokens, cache: &windows
+            )
+            return RumbleAsrModel.join(committed + [tail])
+        }
+
+        private mutating func commitCompletedPieces(_ samples: [Float], startingAt offset: Int) throws {
+            try Task.checkCancellation()
+            guard offset >= 0, offset <= committedSamples, committedSamples - offset <= samples.count else {
+                throw Failure.unexpectedLayout("live audio range")
+            }
+            var start = committedSamples - offset
+            while samples.count - start > model.longestPiece {
+                let end = RumbleAsrModel.pieceEnd(
+                    in: samples, start: start, longest: model.longestPiece, sampleRate: model.manifest.sampleRate
+                )
+                let result = try model.transcribePiece(
+                    Array(samples[start..<end]), languageTokens: languageTokens, cache: &windows
+                )
+                committed.append(result)
+                committedSamples = offset + end
+                start = end
+                windows.removeAll(keepingCapacity: true)
+                try Task.checkCancellation()
+            }
+        }
+    }
+
+    private static func join(_ pieces: [Transcript]) -> Transcript {
+        Transcript(
+            text: pieces.map(\.text).filter { !$0.isEmpty }.joined(separator: " "),
+            tokens: pieces.flatMap(\.tokens)
+        )
+    }
+
+    private struct EncodedWindow {
+        let melFrames: Int
+        let input: [Float16]
+        let audio: [[Float16]]
+        let ctc: [Int]
+    }
+
+    private var longestPiece: Int {
+        manifest.maxAudioFrames * manifest.hopLength * manifest.windowMelFrames / manifest.windowAudioFrames
+    }
+
+    private func transcribePiece(
+        _ input: [Float], languageTokens: [Int], cache: inout [EncodedWindow]
+    ) throws -> Transcript {
+        try autoreleasepool {
+            let started = ProcessInfo.processInfo.systemUptime
+            var samples = input
+            if samples.count < manifest.minimumSamples {
+                samples += [Float](repeating: 0, count: manifest.minimumSamples - samples.count)
+            }
+            let features = mel.compute(samples)
+            let count = (features.frames + manifest.windowMelFrames - 1) / manifest.windowMelFrames
+            try encode(features: features, windowCount: count, cache: &cache)
+            return try decodePiece(cache, samples: input.count, languageTokens: languageTokens, started: started)
+        }
+    }
+
+    private func decodePiece(
+        _ windows: [EncodedWindow], samples: Int, languageTokens: [Int], started: TimeInterval
+    ) throws -> Transcript {
+        let audio = windows.flatMap(\.audio)
+        let draft = draft(from: windows)
         let encoded = ProcessInfo.processInfo.systemUptime
 
         let prompt = manifest.prefix.count + audio.count + manifest.afterAudio.count + languageTokens.count
@@ -137,6 +229,7 @@ public final class RumbleAsrModel: @unchecked Sendable {
         rows += (manifest.afterAudio + languageTokens).map(embedding)
         var last = 0
         for start in stride(from: 0, to: rows.count, by: manifest.block) {
+            try Task.checkCancellation()
             last = try session.run(Array(rows[start..<min(start + manifest.block, rows.count)])).last ?? 0
         }
         let prefilled = ProcessInfo.processInfo.systemUptime
@@ -146,6 +239,7 @@ public final class RumbleAsrModel: @unchecked Sendable {
         var accepted = 0
         let limit = min(manifest.maxGeneratedTokens, manifest.capacity - prompt - manifest.block)
         while let token = output.last, !manifest.eos.contains(token), output.count < limit {
+            try Task.checkCancellation()
             let proposal = [token] + Array(draft[min(pointer, draft.count)..<min(pointer + manifest.block - 1, draft.count)])
             let predicted = try session.run(proposal.map(embedding))
             var agreed = 0
@@ -161,31 +255,39 @@ public final class RumbleAsrModel: @unchecked Sendable {
         let text = decode(Array(written))
         let finished = ProcessInfo.processInfo.systemUptime
         log(
-            "rumble piece samples=\(input.count) encoderMs=\(Int((encoded - started) * 1000)) "
+            "rumble piece samples=\(samples) encoderMs=\(Int((encoded - started) * 1000)) "
                 + "prefillMs=\(Int((prefilled - encoded) * 1000)) decodeMs=\(Int((finished - prefilled) * 1000)) "
                 + "draft=\(draft.count) accepted=\(accepted) calls=\(session.calls) tokens=\(written.count) chars=\(text.count)"
         )
         return Transcript(text: text, tokens: Array(written))
     }
 
-    private func encode(features: [Float], frames: Int) throws -> (audio: [[Float16]], draft: [Int]) {
+    private func encode(
+        features: (values: [Float], frames: Int), windowCount: Int, cache: inout [EncodedWindow]
+    ) throws {
         let window = manifest.windowMelFrames
+        if cache.count > windowCount { cache.removeLast(cache.count - windowCount) }
         let melInput = try Self.zeros([1, manifest.melBins, window], .float16)
         let maskInput = try Self.zeros([1, manifest.windowAudioFrames], .float16)
         let mels = melInput.dataPointer.assumingMemoryBound(to: Float16.self)
         let mask = maskInput.dataPointer.assumingMemoryBound(to: Float16.self)
-        var audio: [[Float16]] = []
-        var ctc: [Int] = []
-        for start in stride(from: 0, to: frames, by: window) {
-            let valid = min(window, frames - start)
+        for index in 0..<windowCount {
+            try Task.checkCancellation()
+            let start = index * window
+            let valid = min(window, features.frames - start)
+            var input = [Float16](repeating: 0, count: manifest.melBins * window)
             for bin in 0..<manifest.melBins {
-                for column in 0..<window {
-                    mels[bin * window + column] = column < valid ? Float16(features[bin * frames + start + column]) : 0
+                for column in 0..<valid {
+                    input[bin * window + column] = Float16(features.values[bin * features.frames + start + column])
                 }
             }
+            if index < cache.count, cache[index].melFrames == valid, cache[index].input == input { continue }
+            input.withUnsafeBufferPointer { buffer in
+                if let base = buffer.baseAddress { mels.update(from: base, count: buffer.count) }
+            }
             let kept = Self.audioFrames(melFrames: valid)
-            for index in 0..<manifest.windowAudioFrames { mask[index] = index < kept ? 1 : 0 }
-            try autoreleasepool {
+            for row in 0..<manifest.windowAudioFrames { mask[row] = row < kept ? 1 : 0 }
+            let encoded = try autoreleasepool {
                 let result = try encoder.prediction(from: MLDictionaryFeatureProvider(dictionary: ["mel": melInput, "frame_mask": maskInput]))
                 let states = try Self.output(result, "audio")
                 let ids = try Self.output(result, "ctc_ids")
@@ -193,19 +295,28 @@ public final class RumbleAsrModel: @unchecked Sendable {
                 let statePointer = states.dataPointer.assumingMemoryBound(to: Float16.self)
                 let idPointer = ids.dataPointer.assumingMemoryBound(to: Int32.self)
                 let rowStride = states.strides[1].intValue
-                for row in 0..<kept {
-                    audio.append(Array(UnsafeBufferPointer(start: statePointer + row * rowStride, count: manifest.hidden)))
-                    ctc.append(Int(idPointer[row * ids.strides[1].intValue]))
+                let idStride = ids.strides[1].intValue
+                let audio = (0..<kept).map { row in
+                    Array(UnsafeBufferPointer(start: statePointer + row * rowStride, count: manifest.hidden))
                 }
+                let ctc = (0..<kept).map { Int(idPointer[$0 * idStride]) }
+                return EncodedWindow(melFrames: valid, input: input, audio: audio, ctc: ctc)
             }
+            if index < cache.count { cache[index] = encoded } else { cache.append(encoded) }
+            log("rumble encoder window=\(index) melFrames=\(valid)")
         }
+    }
+
+    private func draft(from windows: [EncodedWindow]) -> [Int] {
         var draft: [Int] = []
         var previous = -1
-        for id in ctc {
-            if id != previous, id != manifest.ctcBlank { draft.append(Int(ctcVocabulary[id])) }
-            previous = id
+        for window in windows {
+            for id in window.ctc {
+                if id != previous, id != manifest.ctcBlank { draft.append(Int(ctcVocabulary[id])) }
+                previous = id
+            }
         }
-        return (audio, draft)
+        return draft
     }
 
     static func audioFrames(melFrames: Int) -> Int {
@@ -237,27 +348,34 @@ public final class RumbleAsrModel: @unchecked Sendable {
     }
 
     static func pieces(of samples: [Float], longest: Int, sampleRate: Int) -> [Range<Int>] {
-        let frame = sampleRate / 10
         var ranges: [Range<Int>] = []
         var start = 0
         while samples.count - start > longest {
-            var cut = start + longest
-            var quietest = Float.infinity
-            var position = start + longest * 2 / 3
-            while position + frame <= start + longest {
-                var energy: Float = 0
-                samples.withUnsafeBufferPointer { vDSP_svesq($0.baseAddress! + position, 1, &energy, vDSP_Length(frame)) }
-                if energy < quietest {
-                    quietest = energy
-                    cut = position + frame / 2
-                }
-                position += frame
-            }
+            let cut = pieceEnd(in: samples, start: start, longest: longest, sampleRate: sampleRate)
             ranges.append(start..<cut)
             start = cut
         }
         ranges.append(start..<samples.count)
         return ranges
+    }
+
+    private static func pieceEnd(in samples: [Float], start: Int, longest: Int, sampleRate: Int) -> Int {
+        let frame = sampleRate / 10
+        var cut = start + longest
+        var quietest = Float.infinity
+        var position = start + longest * 2 / 3
+        while position + frame <= start + longest {
+            var energy: Float = 0
+            samples.withUnsafeBufferPointer { buffer in
+                if let base = buffer.baseAddress { vDSP_svesq(base + position, 1, &energy, vDSP_Length(frame)) }
+            }
+            if energy < quietest {
+                quietest = energy
+                cut = position + frame / 2
+            }
+            position += frame
+        }
+        return cut
     }
 
     private struct DecoderSession {
