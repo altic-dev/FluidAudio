@@ -84,10 +84,12 @@ public final class RumbleAsrModel: @unchecked Sendable {
         self.manifest = manifest
 
         func load(_ name: String) throws -> MLModel {
+            try Task.checkCancellation()
             let started = ProcessInfo.processInfo.systemUptime
             let configuration = MLModelConfiguration()
             configuration.computeUnits = .cpuAndNeuralEngine
             let model = try MLModel(contentsOf: directory.appendingPathComponent("\(name).mlmodelc", isDirectory: true), configuration: configuration)
+            try Task.checkCancellation()
             log("rumble load step=\(name) ms=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))")
             return model
         }
