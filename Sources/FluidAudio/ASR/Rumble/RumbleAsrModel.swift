@@ -362,12 +362,13 @@ public final class RumbleAsrModel: @unchecked Sendable {
     private static func pieceEnd(in samples: [Float], start: Int, longest: Int, sampleRate: Int) -> Int {
         let frame = sampleRate / 10
         var cut = start + longest
-        var quietest = Float.infinity
+        var quietest = Double.infinity
         var position = start + longest * 2 / 3
         while position + frame <= start + longest {
-            var energy: Float = 0
-            samples.withUnsafeBufferPointer { buffer in
-                if let base = buffer.baseAddress { vDSP_svesq(base + position, 1, &energy, vDSP_Length(frame)) }
+            var energy = 0.0
+            for index in position..<(position + frame) {
+                let sample = Double(samples[index])
+                energy += sample * sample
             }
             if energy < quietest {
                 quietest = energy
