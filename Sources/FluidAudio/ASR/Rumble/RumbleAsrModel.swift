@@ -30,6 +30,7 @@ public final class RumbleAsrModel: @unchecked Sendable {
         public let ctcBlank: Int
         public let maxAudioFrames: Int
         public let maxGeneratedTokens: Int
+        public let spacelessLanguages: [String]
     }
 
     public enum Failure: LocalizedError {
@@ -111,28 +112,39 @@ public final class RumbleAsrModel: @unchecked Sendable {
     public func transcribe(samples: [Float], language: String) throws -> Transcript {
         guard let languageTokens = manifest.languages[language] else { throw Failure.unsupportedLanguage(language) }
         guard !samples.isEmpty else { return Transcript(text: "", tokens: []) }
-        let results = try Self.pieces(of: samples, longest: longestPiece, sampleRate: manifest.sampleRate).map { range in
+        let spaceless = manifest.spacelessLanguages.contains(language)
+        var stitcher = RumbleStitcher(spaceless: spaceless, margin: manifest.sampleRate)
+        for span in Self.spans(of: samples, longest: longestPiece, sampleRate: manifest.sampleRate) {
             var windows: [EncodedWindow] = []
-            return try transcribePiece(Array(samples[range]), languageTokens: languageTokens, cache: &windows)
+            let words = try heardWords(
+                Array(samples[span.piece]), at: span.piece.lowerBound, languageTokens: languageTokens,
+                spaceless: spaceless, cache: &windows
+            )
+            stitcher.add(words, sharedWithNext: span.shared)
         }
-        return Self.join(results)
+        return Transcript(text: stitcher.text(), tokens: stitcher.tokens)
     }
 
     public func makeLiveTranscription(language: String) throws -> LiveTranscription {
         guard let languageTokens = manifest.languages[language] else { throw Failure.unsupportedLanguage(language) }
-        return LiveTranscription(model: self, languageTokens: languageTokens)
+        return LiveTranscription(
+            model: self, languageTokens: languageTokens, spaceless: manifest.spacelessLanguages.contains(language)
+        )
     }
 
     public struct LiveTranscription {
         private let model: RumbleAsrModel
         private let languageTokens: [Int]
-        private var committed: [Transcript] = []
+        private let spaceless: Bool
+        private var stitcher: RumbleStitcher
         private var windows: [EncodedWindow] = []
         public private(set) var committedSamples = 0
 
-        fileprivate init(model: RumbleAsrModel, languageTokens: [Int]) {
+        fileprivate init(model: RumbleAsrModel, languageTokens: [Int], spaceless: Bool) {
             self.model = model
             self.languageTokens = languageTokens
+            self.spaceless = spaceless
+            stitcher = RumbleStitcher(spaceless: spaceless, margin: model.manifest.sampleRate)
         }
 
         public mutating func update(samples: [Float], startingAt offset: Int = 0) throws -> String {
@@ -147,17 +159,29 @@ public final class RumbleAsrModel: @unchecked Sendable {
                 let features = model.mel.compute(Array(samples[start...]))
                 try model.encode(features: features, windowCount: count, cache: &windows)
             }
-            let draft = model.draft(from: windows)
-            return RumbleAsrModel.join(committed + [Transcript(text: model.decode(draft), tokens: draft)]).text
+            let runs = model.draftRuns(from: windows)
+            let draft = Timed(tokens: runs.map(\.token), times: runs.map(\.sample), runs: runs, covered: runs.map { _ in true })
+            let preview = model.words(of: draft, at: committedSamples, spaceless: spaceless)
+            return stitcher.text(with: preview)
         }
 
-        public mutating func finish(samples: [Float]) throws -> Transcript {
-            try commitCompletedPieces(samples, startingAt: 0)
-            guard samples.count > committedSamples else { return RumbleAsrModel.join(committed) }
-            let tail = try model.transcribePiece(
-                Array(samples[committedSamples...]), languageTokens: languageTokens, cache: &windows
-            )
-            return RumbleAsrModel.join(committed + [tail])
+        public mutating func commit(samples: [Float], startingAt offset: Int = 0) throws {
+            try commitCompletedPieces(samples, startingAt: offset)
+        }
+
+        public mutating func finish(samples: [Float], startingAt offset: Int = 0) throws -> Transcript {
+            try commitCompletedPieces(samples, startingAt: offset)
+            let start = committedSamples - offset
+            let words = samples.count > start
+                ? try model.heardWords(
+                    Array(samples[start...]), at: committedSamples, languageTokens: languageTokens,
+                    spaceless: spaceless, cache: &windows
+                )
+                : []
+            stitcher.add(words, sharedWithNext: nil)
+            committedSamples = offset + samples.count
+            windows.removeAll(keepingCapacity: true)
+            return Transcript(text: stitcher.text(), tokens: stitcher.tokens)
         }
 
         private mutating func commitCompletedPieces(_ samples: [Float], startingAt offset: Int) throws {
@@ -167,26 +191,20 @@ public final class RumbleAsrModel: @unchecked Sendable {
             }
             var start = committedSamples - offset
             while samples.count - start > model.longestPiece {
-                let end = RumbleAsrModel.pieceEnd(
+                let span = RumbleAsrModel.nextSpan(
                     in: samples, start: start, longest: model.longestPiece, sampleRate: model.manifest.sampleRate
                 )
-                let result = try model.transcribePiece(
-                    Array(samples[start..<end]), languageTokens: languageTokens, cache: &windows
+                let words = try model.heardWords(
+                    Array(samples[span.piece]), at: offset + span.piece.lowerBound, languageTokens: languageTokens,
+                    spaceless: spaceless, cache: &windows
                 )
-                committed.append(result)
-                committedSamples = offset + end
-                start = end
+                stitcher.add(words, sharedWithNext: span.shared.map { (offset + $0.lowerBound)..<(offset + $0.upperBound) })
+                committedSamples = offset + span.next
+                start = span.next
                 windows.removeAll(keepingCapacity: true)
                 try Task.checkCancellation()
             }
         }
-    }
-
-    private static func join(_ pieces: [Transcript]) -> Transcript {
-        Transcript(
-            text: pieces.map(\.text).filter { !$0.isEmpty }.joined(separator: " "),
-            tokens: pieces.flatMap(\.tokens)
-        )
     }
 
     private struct EncodedWindow {
@@ -200,9 +218,149 @@ public final class RumbleAsrModel: @unchecked Sendable {
         manifest.maxAudioFrames * manifest.hopLength * manifest.windowMelFrames / manifest.windowAudioFrames
     }
 
+    struct Timed {
+        let tokens: [Int]
+        let times: [Int]
+        let runs: [(token: Int, sample: Int)]
+        let covered: [Bool]
+    }
+
+    struct Span {
+        let piece: Range<Int>
+        let next: Int
+
+        var shared: Range<Int>? { next < piece.upperBound ? next..<piece.upperBound : nil }
+    }
+
+    private func heardWords(
+        _ input: [Float], at offset: Int, languageTokens: [Int], spaceless: Bool, cache: inout [EncodedWindow]
+    ) throws -> [RumbleWord] {
+        let timed = try transcribePiece(input, languageTokens: languageTokens, cache: &cache)
+        var words = self.words(of: timed, at: offset, spaceless: spaceless)
+        let pad = manifest.sampleRate * 2 / 5
+        let gaps = Self.uncovered(timed, sampleRate: manifest.sampleRate).filter { gap in
+            let slice = input[max(0, gap.samples.lowerBound)..<min(input.count, gap.samples.upperBound)]
+            let power = slice.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(max(1, slice.count))
+            return power.squareRoot() >= 0.005
+        }.sorted { $0.samples.count > $1.samples.count }
+        for (gap, reachesEnd) in gaps.prefix(2) {
+            let from = max(0, gap.lowerBound - pad)
+            let to = min(input.count, gap.upperBound + pad)
+            guard to - from >= manifest.sampleRate else { continue }
+            var fresh: [EncodedWindow] = []
+            let retry = try transcribePiece(Array(input[from..<to]), languageTokens: languageTokens, cache: &fresh)
+            let inside = (offset + gap.lowerBound)..<(reachesEnd ? Int.max : offset + gap.upperBound)
+            var found = self.words(of: retry, at: offset + from, spaceless: spaceless).filter { inside.contains($0.time) }
+            let before = words.last { $0.time < inside.lowerBound }
+            let after = words.first { $0.time >= inside.upperBound }
+            if let first = found.first, first.key == before?.key, !first.key.isEmpty { found.removeFirst() }
+            if let last = found.last, last.key == after?.key, !last.key.isEmpty { found.removeLast() }
+            guard !found.isEmpty else { continue }
+            log("rumble recovered words=\(found.count) from=\(gap.lowerBound) to=\(gap.upperBound)")
+            words = (words.filter { !inside.contains($0.time) } + found).enumerated()
+                .sorted { ($0.element.time, $0.offset) < ($1.element.time, $1.offset) }.map(\.element)
+        }
+        return words
+    }
+
+    static func uncovered(_ timed: Timed, sampleRate: Int) -> [(samples: Range<Int>, reachesEnd: Bool)] {
+        var gaps: [(samples: Range<Int>, reachesEnd: Bool)] = []
+        var index = 0
+        let frame = sampleRate * 2 / 26
+        while index < timed.runs.count {
+            guard !timed.covered[index] else {
+                index += 1
+                continue
+            }
+            var end = index
+            while end < timed.runs.count, !timed.covered[end] { end += 1 }
+            let stretch = timed.runs[index..<end]
+            let first = stretch.first!.sample
+            let last = stretch.last!.sample
+            let written = timed.times.filter { $0 >= first && $0 < last + frame }.count
+            if stretch.count >= 6, Set(stretch.map(\.token)).count >= 3, last - first >= sampleRate * 6 / 5,
+               written * 10 < stretch.count {
+                gaps.append((first..<(last + frame), end == timed.runs.count))
+            }
+            index = end
+        }
+        return gaps
+    }
+
+    func words(of timed: Timed, at offset: Int, spaceless: Bool) -> [RumbleWord] {
+        guard !timed.runs.isEmpty else { return [] }
+        return spaceless ? characterWords(timed, at: offset) : spacedWords(timed, at: offset)
+    }
+
+    private func spacedWords(_ timed: Timed, at offset: Int) -> [RumbleWord] {
+        var words: [RumbleWord] = []
+        var tokens: [Int] = []
+        var bytes = Data()
+        var time = 0
+        func close() {
+            if !tokens.isEmpty {
+                let text = String(decoding: bytes, as: UTF8.self)
+                words.append(RumbleWord(
+                    tokens: tokens, text: text, time: offset + time, key: RumbleWord.key(of: text),
+                    startsWithSpace: bytes.first.map(RumbleWord.isSpace) ?? false
+                ))
+            }
+            tokens = []
+            bytes = Data()
+        }
+        for (index, token) in timed.tokens.enumerated() {
+            let piece = pieces.indices.contains(token) ? pieces[token] : Data()
+            if tokens.isEmpty || piece.first.map(RumbleWord.isSpace) == true {
+                close()
+                time = timed.times[index]
+            }
+            tokens.append(token)
+            bytes.append(piece)
+        }
+        close()
+        return words
+    }
+
+    private func characterWords(_ timed: Timed, at offset: Int) -> [RumbleWord] {
+        var bytes = Data()
+        var owners: [Int] = []
+        for (index, token) in timed.tokens.enumerated() {
+            let piece = pieces.indices.contains(token) ? pieces[token] : Data()
+            bytes.append(piece)
+            owners += [Int](repeating: index, count: piece.count)
+        }
+        var words: [RumbleWord] = []
+        var position = 0
+        var claimed = -1
+        for character in String(decoding: bytes, as: UTF8.self) {
+            let width = character.utf8.count
+            let owner = owners.indices.contains(position) ? owners[position] : (owners.last ?? 0)
+            let last = min(owners.count, position + width) - 1
+            let through = last >= 0 && owners.indices.contains(last) ? owners[last] : owner
+            let tokens = claimed < through ? Array(timed.tokens[(claimed + 1)...through]) : []
+            claimed = max(claimed, through)
+            position += width
+            let text = String(character)
+            let time = timed.times.indices.contains(owner) ? timed.times[owner] : 0
+            if character.isASCII, character.isLetter || character.isNumber, let previous = words.last,
+               previous.text.last.map({ $0.isASCII && ($0.isLetter || $0.isNumber) }) == true {
+                words[words.count - 1] = RumbleWord(
+                    tokens: previous.tokens + tokens, text: previous.text + text, time: previous.time,
+                    key: RumbleWord.key(of: previous.text + text), startsWithSpace: false
+                )
+            } else {
+                words.append(RumbleWord(
+                    tokens: tokens, text: text, time: offset + time, key: RumbleWord.key(of: text),
+                    startsWithSpace: character.isWhitespace
+                ))
+            }
+        }
+        return words
+    }
+
     private func transcribePiece(
         _ input: [Float], languageTokens: [Int], cache: inout [EncodedWindow]
-    ) throws -> Transcript {
+    ) throws -> Timed {
         try autoreleasepool {
             let started = ProcessInfo.processInfo.systemUptime
             var samples = input
@@ -212,13 +370,13 @@ public final class RumbleAsrModel: @unchecked Sendable {
             let features = mel.compute(samples)
             let count = (features.frames + manifest.windowMelFrames - 1) / manifest.windowMelFrames
             try encode(features: features, windowCount: count, cache: &cache)
-            return try decodePiece(cache, samples: input.count, languageTokens: languageTokens, started: started)
+            return try decodePiece(cache, samples: samples.count, languageTokens: languageTokens, started: started)
         }
     }
 
     private func decodePiece(
         _ windows: [EncodedWindow], samples: Int, languageTokens: [Int], started: TimeInterval
-    ) throws -> Transcript {
+    ) throws -> Timed {
         let audio = windows.flatMap(\.audio)
         let draft = draft(from: windows)
         let encoded = ProcessInfo.processInfo.systemUptime
@@ -261,7 +419,85 @@ public final class RumbleAsrModel: @unchecked Sendable {
                 + "prefillMs=\(Int((prefilled - encoded) * 1000)) decodeMs=\(Int((finished - prefilled) * 1000)) "
                 + "draft=\(draft.count) accepted=\(accepted) calls=\(session.calls) tokens=\(written.count) chars=\(text.count)"
         )
-        return Transcript(text: text, tokens: Array(written))
+        let runs = draftRuns(from: windows)
+        let aligned = Self.align(Array(written), to: runs, length: samples, step: manifest.sampleRate * 3 / 20)
+        return Timed(tokens: Array(written), times: aligned.times, runs: runs, covered: aligned.covered)
+    }
+
+    private func draftRuns(from windows: [EncodedWindow]) -> [(token: Int, sample: Int)] {
+        let windowSamples = manifest.windowMelFrames * manifest.hopLength
+        var runs: [(token: Int, sample: Int)] = []
+        var previous = -1
+        for (index, window) in windows.enumerated() {
+            for (frame, id) in window.ctc.enumerated() {
+                if id != previous, id != manifest.ctcBlank, ctcVocabulary.indices.contains(id) {
+                    runs.append((Int(ctcVocabulary[id]), index * windowSamples + frame * windowSamples / manifest.windowAudioFrames))
+                }
+                previous = id
+            }
+        }
+        return runs
+    }
+
+    static func align(
+        _ tokens: [Int], to runs: [(token: Int, sample: Int)], length: Int, step: Int
+    ) -> (times: [Int], covered: [Bool]) {
+        let n = tokens.count
+        let m = runs.count
+        let band = max(16, abs(n - m) + 8)
+        func matches(_ i: Int, _ j: Int) -> Bool {
+            tokens[i] == runs[j].token && abs(i - j) <= band
+        }
+        var table = [[Int32]](repeating: [Int32](repeating: 0, count: m + 1), count: n + 1)
+        if n > 0, m > 0 {
+            for i in stride(from: n - 1, through: 0, by: -1) {
+                for j in stride(from: m - 1, through: 0, by: -1) {
+                    table[i][j] = matches(i, j) ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
+                }
+            }
+        }
+        var matched = [Int?](repeating: nil, count: n)
+        var covered = [Bool](repeating: false, count: m)
+        var i = 0
+        var j = 0
+        while i < n, j < m {
+            if matches(i, j), table[i][j] == table[i + 1][j + 1] + 1 {
+                matched[i] = runs[j].sample
+                covered[j] = true
+                i += 1
+                j += 1
+            } else if table[i + 1][j] >= table[i][j + 1] {
+                i += 1
+            } else {
+                j += 1
+            }
+        }
+        var times = [Int](repeating: 0, count: n)
+        var index = 0
+        while index < n {
+            if let time = matched[index] {
+                times[index] = time
+                index += 1
+                continue
+            }
+            let before = index - 1
+            var after = index
+            while after < n, matched[after] == nil { after += 1 }
+            for gap in index..<after {
+                if before >= 0, after < n {
+                    times[gap] = times[before] + (matched[after]! - times[before]) * (gap - before) / (after - before)
+                } else if before >= 0 {
+                    times[gap] = min(length, times[before] + (gap - before) * step)
+                } else if after < n {
+                    times[gap] = max(0, matched[after]! - (after - gap) * step)
+                } else {
+                    times[gap] = min(length, (runs.first?.sample ?? 0) + gap * step)
+                }
+            }
+            index = after
+        }
+        for k in times.indices.dropFirst() where times[k] < times[k - 1] { times[k] = times[k - 1] }
+        return (times, covered)
     }
 
     private func encode(
@@ -349,34 +585,43 @@ public final class RumbleAsrModel: @unchecked Sendable {
         return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func pieces(of samples: [Float], longest: Int, sampleRate: Int) -> [Range<Int>] {
-        var ranges: [Range<Int>] = []
+    static func spans(of samples: [Float], longest: Int, sampleRate: Int) -> [Span] {
+        var spans: [Span] = []
         var start = 0
         while samples.count - start > longest {
-            let cut = pieceEnd(in: samples, start: start, longest: longest, sampleRate: sampleRate)
-            ranges.append(start..<cut)
-            start = cut
+            let span = nextSpan(in: samples, start: start, longest: longest, sampleRate: sampleRate)
+            spans.append(span)
+            start = span.next
         }
-        ranges.append(start..<samples.count)
-        return ranges
+        spans.append(Span(piece: start..<samples.count, next: samples.count))
+        return spans
     }
 
-    private static func pieceEnd(in samples: [Float], start: Int, longest: Int, sampleRate: Int) -> Int {
+    static func nextSpan(in samples: [Float], start: Int, longest: Int, sampleRate: Int) -> Span {
         let frame = sampleRate / 10
-        var cut = start + longest
+        let cut = quietest(in: samples, from: start + longest * 2 / 3, to: start + longest, frame: frame, latest: true)
+        let from = max(start + longest / 2, cut - 3 * sampleRate)
+        let to = cut - sampleRate
+        let next = to - from >= frame ? quietest(in: samples, from: from, to: to, frame: frame) : cut
+        return Span(piece: start..<cut, next: next)
+    }
+
+    private static func quietest(in samples: [Float], from: Int, to: Int, frame: Int, latest: Bool = false) -> Int {
+        var cut = to
         var quietest = Double.infinity
-        var position = start + longest * 2 / 3
-        while position + frame <= start + longest {
+        var position = from
+        let step = max(1, frame / 4)
+        while position + frame <= to {
             var energy = 0.0
             for index in position..<(position + frame) {
                 let sample = Double(samples[index])
                 energy += sample * sample
             }
-            if energy < quietest {
+            if energy < quietest || latest && energy == quietest {
                 quietest = energy
                 cut = position + frame / 2
             }
-            position += frame
+            position += step
         }
         return cut
     }
